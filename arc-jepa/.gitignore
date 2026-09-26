@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+runs/
+data/*.jsonl
+data/synth*/
+*.safetensors
+*.pt
+*.npz
+kaggle/out/
+.env
+kaggle.json
+*.log

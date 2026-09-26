@@ -1,0 +1,10 @@
+[project]
+name = "arcjepa"
+version = "0.1.0"
+description = "ARC-JEPA: Object-Centric Transformation JEPA with Latent-Guided Program Search for ARC-AGI-2"
+requires-python = ">=3.11"
+dependencies = ["torch>=2.6", "numpy>=1.26", "pyyaml>=6.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
