@@ -1,0 +1,135 @@
+# ARC-JEPA v1 base training config (docs/FROZEN_SPEC.md "v1 config" + §Training stages A-D).
+# Other configs inherit this file (`inherit: base.yaml`) and override single keys.
+seed: 20260926
+
+model:                       # ModelConfig preset, then explicit dims (the spec's v1 yaml)
+  preset: v1
+  cell_dim: 256
+  object_dim: 256
+  relation_dim: 256
+  jepa_dim: 512
+  rule_dim: 256
+  program_dim: 256
+  cell_layers: 12
+  object_layers: 4
+  relation_layers: 4
+  predictor_layers: 6
+  program_layers: 6
+  heads: 8
+  ffn_dim: 1024
+
+jepa:                        # loss weights (L = 1.0 L_g + 1.0 L_o + 0.5 L_r + 0.5 L_prog + 0.5 L_rank + 0.05 L_var)
+  ema_start: 0.996
+  ema_end: 0.9995
+  global_loss: 1.0
+  object_loss: 1.0
+  relation_loss: 0.5
+  program_loss: 0.5
+  ranking_loss: 0.5
+  variance_loss: 0.05
+  margin: 0.2
+
+training:
+  optimizer: adamw
+  lr: 1.5e-4
+  weight_decay: 0.05
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  warmup_epochs: 5
+  precision: bf16            # autocast on CUDA only; CPU runs fp32
+  grad_clip: 1.0
+  min_lr_ratio: 0.01
+  device: auto               # auto | cuda | cpu
+  num_workers: 4             # DataLoader workers per rank
+  log_every: 50
+  checkpoint_minutes: 20
+  keep_stage_checkpoints: true
+  hours: 9.5                 # default for --hours
+  reserve_frac: 0.05         # share of the budget kept for the package export
+  time_fractions: {A: 0.45, B: 0.25, C: 0.15, D: 0.15}
+
+data:
+  root: null                 # null -> $ARCJEPA_DATA, local mirror, Kaggle mount (arcjepa.data.resolve_root)
+  out_objects: true          # parse output grids too (object targets for L_o)
+  out_objects_drop: 0.5      # per-batch probability of training without output objects (inference layout)
+
+synthetic:
+  path: null                 # existing JSONL, else generated into <out>/synthetic_<n>_<seed>.jsonl
+  n_tasks: 1000000           # spec phase 3 (phase 1 = 100k, phase 2 = 500k)
+  seed: 1
+  workers: 8
+  n_pairs: [3, 6]
+  max_ctx: 5                 # context slots of synthetic episodes (n_pairs max - 1)
+  heldout_min: 64            # retrieval set = val_comp compositions, topped up from train if smaller
+  heldout_max: 512
+
+stages:
+  A:                         # synthetic JEPA pretraining
+    enabled: true
+    min_steps: 1             # optimizer steps taken even when the time budget is already spent
+    lr: 1.5e-4
+    epochs: 50
+    warmup_epochs: 5
+    batch_size: 128          # per GPU (x4 GPUs = global 512)
+    accum_steps: 1
+    max_steps: null
+    epoch_size: null
+  B:                         # real ARC adaptation on the 700 re-split train tasks
+    enabled: true
+    min_steps: 1             # optimizer steps taken even when the time budget is already spent
+    lr: 3.0e-5
+    epochs: 100
+    warmup_epochs: 5
+    batch_size: 32           # tasks per GPU
+    epoch_size: 700
+    max_ctx: 10
+    configs: [episodes, episodes_aug, arcgen_fresh, sdg_hard]
+    hf_splits: [train, val, test]   # files of the HF mirror; eval_public is never read
+    max_per_config: null
+    family_alpha: 0.5        # sampling weight = family_count^-alpha, without replacement per epoch
+    val_episodes: 256        # 150-task val split episodes for model selection
+  C:                         # program alignment (program encoder + scorer + rule-latent head)
+    enabled: true
+    min_steps: 1             # optimizer steps taken even when the time budget is already spent
+    lr: 1.0e-4
+    epochs: 30
+    warmup_epochs: 1
+    batch_size: 128
+    n_samples: 500000        # exact-program samples per epoch (capped by the synthetic train split)
+    train_modules: [program_encoder, scorer, rule_latent]
+    core_lr_mult: 0.1        # core JEPA mostly frozen (0 = frozen)
+    loss: {program_loss: 1.0, ranking_loss: 0.0}
+  D:                         # hard negatives: 8 per positive, pairwise ranking
+    enabled: true
+    min_steps: 1             # optimizer steps taken even when the time budget is already spent
+    lr: 1.0e-4
+    epochs: 10
+    warmup_epochs: 1
+    batch_size: 64
+    negatives: 8
+    n_samples: 250000
+    train_modules: [program_encoder, scorer, rule_latent]
+    core_lr_mult: 0.1
+    loss: {program_loss: 1.0, ranking_loss: 1.0}
+
+eval:
+  every_steps: 2000          # retrieval eval period inside program stages (C, D)
+  retrieval_k: [1, 8]
+  batch_size: 32
+
+memory:
+  top_k: 16
+  max_synthetic: 20000       # synthetic train programs in the exported memory
+  include_real: true         # 700 re-split training tasks (never val / holdout / eval)
+  max_real: null
+  pseudo_label_seconds: 0.5  # beam budget per real task; a label is kept only if it fits ALL train pairs
+
+export:
+  dir: package
+  safetensors: true
+
+# inference knobs copied into the package config.json
+search: {beam_width: 64, max_depth: 6, top_primitives: 8, astar_max_nodes: 50000}
+tta: {enabled: true, steps: 8, lr: 0.05, anchor_weight: 0.1}
+repair: {enabled: true, max_rounds: 4}
+outputs: {num_candidates: 2}

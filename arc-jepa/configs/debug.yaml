@@ -1,0 +1,53 @@
+# CPU smoke config: tiny model, 200 synthetic tasks, 20 steps per stage, small real subset. Completes
+# end-to-end in well under 3 minutes:
+#   python -m arcjepa.training.train_all --config configs/debug.yaml --hours 0.03 --out runs/debug
+inherit: base.yaml
+seed: 7
+
+model:
+  preset: tiny
+  cell_dim: 64
+  object_dim: 64
+  relation_dim: 64
+  jepa_dim: 64
+  rule_dim: 64
+  program_dim: 64
+  cell_layers: 2
+  object_layers: 2
+  relation_layers: 2
+  predictor_layers: 2
+  program_layers: 2
+  heads: 4
+  ffn_dim: 128
+
+training:
+  precision: fp32
+  device: cpu
+  num_workers: 0
+  log_every: 5
+  checkpoint_minutes: 0.25
+  keep_stage_checkpoints: false
+  hours: 0.03
+  reserve_frac: 0.15
+
+synthetic:
+  n_tasks: 200
+  workers: 1
+  heldout_min: 16
+  heldout_max: 32
+
+stages:
+  A: {batch_size: 2, epochs: 1, warmup_epochs: 0.1, max_steps: 20}
+  B: {batch_size: 2, epochs: 1, warmup_epochs: 0.1, max_steps: 20, epoch_size: 80, max_per_config: 24,
+      max_ctx: 5, val_episodes: 8}
+  C: {batch_size: 2, epochs: 1, warmup_epochs: 0.1, max_steps: 20, n_samples: null}
+  D: {batch_size: 2, epochs: 1, warmup_epochs: 0.1, max_steps: 20, negatives: 8, n_samples: null}
+
+eval:
+  every_steps: 10
+  batch_size: 16
+
+memory:
+  max_synthetic: 24
+  max_real: 4
+  pseudo_label_seconds: 0.25

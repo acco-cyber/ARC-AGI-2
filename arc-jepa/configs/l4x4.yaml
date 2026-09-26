@@ -1,0 +1,24 @@
+# Kaggle L4 x 4 (4 x 22 GiB): torchrun --nproc_per_node 4, micro-batch 64 per GPU (global 256), bf16.
+#   torchrun --standalone --nproc_per_node 4 -m arcjepa.training.train_all --config configs/l4x4.yaml --hours 9.5 --out RUN
+inherit: base.yaml
+
+training:
+  precision: bf16
+  device: auto
+  num_workers: 4
+  log_every: 50
+  checkpoint_minutes: 20
+  hours: 9.5
+
+synthetic:
+  n_tasks: 100000            # phase 1, generated in-session on CPU workers
+  workers: 8
+
+stages:
+  A: {batch_size: 64, accum_steps: 1}       # global 256
+  B: {batch_size: 32}
+  C: {batch_size: 64, n_samples: 100000}
+  D: {batch_size: 32, n_samples: 100000}
+
+memory:
+  max_synthetic: 20000
