@@ -1,6 +1,6 @@
 # Kaggle training notebook (poby7722/arc-jepa-train): L4 x 4 settings + Kaggle paths. The notebook sets
-# --hours from ARCJEPA_TRAIN_HOURS (default 9.5) and --out /kaggle/working/run; the package is exported to
-# /kaggle/working/arc_jepa_pkg.
+# --hours from ARCJEPA_TRAIN_HOURS (default 7.5 in the FULL build kaggle/train_full, minus the time already spent
+# and a 0.25 h margin) and --out /kaggle/working/run; the package is exported to /kaggle/working/arc_jepa_pkg.
 inherit: l4x4.yaml
 
 data:

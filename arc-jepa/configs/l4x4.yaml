@@ -1,5 +1,19 @@
-# Kaggle L4 x 4 (4 x 22 GiB): torchrun --nproc_per_node 4, micro-batch 64 per GPU (global 256), bf16.
+# Kaggle L4 x 4 (4 x 22 GiB): torchrun --nproc_per_node 4, bf16, global batches as before (A/C 256, B/D 128).
 #   torchrun --standalone --nproc_per_node 4 -m arcjepa.training.train_all --config configs/l4x4.yaml --hours 9.5 --out RUN
+#
+# Per-GPU micro-batches are small with gradient accumulation (09-26 measurement, runs/fixcheck_measure/): autograd
+# saves ~2.1 GB fp32 per stage-A episode at a 30x30 batch crop (~1.2 GB at 20x30), ~4.0 GB per stage-B episode with
+# 10 demos at 30x30, and 64-object grids add ~1.4 MB per object crop per grid; bf16 autocast keeps ~0.57-0.65 of
+# that. The cell encoder crops each batch to its largest grid, and 91 % of 8-episode synthetic batches reach a
+# side >= 25, so 30x30 is the planning case: 8 x ~1.4-2.2 GB (A/C/D) and 4 x ~2.6-4 GB (B) fit 22 GiB next to
+# ~1.5 GB of weights/optimizer/EMA. A CUDA OOM halves the micro-batch once (training.oom_max_split) instead of
+# crashing. The old 64-per-GPU micro-batch would need ~90-140 GB per GPU.
+#
+# Throughput (09-26 night, docs/INTEGRATION_ROUND_FINAL.md "Training-path fixes"): one stage-A micro-batch (8
+# episodes, all grids 30x30) is ~8.7 TFLOP fwd+bwd; real synthetic batches average 0.55 of that (the crop is the
+# batch's largest grid). At an assumed 8-15 effective bf16 TFLOPS per L4, a 7.5 h notebook gives stage A ~2.7k-5.3k
+# optimizer steps of global batch 256. Stage B's 100 planned epochs (500 steps) take ~10-20 min, and time a stage
+# leaves unused only rolls FORWARD (B -> C/D), so B's share moves to A and C.
 inherit: base.yaml
 
 training:
@@ -9,16 +23,18 @@ training:
   log_every: 50
   checkpoint_minutes: 20
   hours: 9.5
+  oom_max_split: 2
+  time_fractions: {A: 0.55, B: 0.10, C: 0.20, D: 0.15}
 
 synthetic:
   n_tasks: 100000            # phase 1, generated in-session on CPU workers
   workers: 8
 
 stages:
-  A: {batch_size: 64, accum_steps: 1}       # global 256
-  B: {batch_size: 32}
-  C: {batch_size: 64, n_samples: 100000}
-  D: {batch_size: 32, n_samples: 100000}
+  A: {batch_size: 8, accum_steps: 8}        # 8 x 8 x 4 GPUs = global 256
+  B: {batch_size: 4, accum_steps: 8}        # 4 x 8 x 4 = global 128 (spec 32 tasks/GPU x 4)
+  C: {batch_size: 8, accum_steps: 8, n_samples: 100000}   # global 256
+  D: {batch_size: 8, accum_steps: 4, n_samples: 100000}   # global 128
 
 memory:
   max_synthetic: 20000

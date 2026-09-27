@@ -106,5 +106,7 @@ class RelationEncoder(nn.Module):
         refined = h[:, 1:]
         full = hi[:, :, None, :] + hj[:, None, :, :] + self.proj_e(e)
         full = full * pair_valid.unsqueeze(-1).to(full.dtype)
-        full = full.index_put((bidx[sel_mask], i_idx[sel_mask], j_idx[sel_mask]), refined[sel_mask])
+        # under bf16 autocast `full` (linear outputs) is bf16 while `refined` (LayerNorm) is fp32: index_put
+        # needs equal dtypes
+        full = full.index_put((bidx[sel_mask], i_idx[sel_mask], j_idx[sel_mask]), refined[sel_mask].to(full.dtype))
         return full, pooled

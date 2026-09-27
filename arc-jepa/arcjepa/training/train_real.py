@@ -1,13 +1,18 @@
-"""Stage B: real ARC adaptation on the 700-task train split (spec §Training, run-order step 3).
+"""Stage B: real ARC adaptation on the train split (spec §Training, run-order step 3).
 
-Data: the ``episodes``, ``episodes_aug``, ``arcgen_fresh`` and ``sdg_hard`` configs of the local HF mirror
-(``arcjepa.data``), restricted to
+Data: the ``episodes``, ``episodes_aug`` and ``arcgen_fresh`` configs of the local HF mirror (``arcjepa.data``),
+restricted by an ALLOWLIST to episodes whose task id is one of the *train* tasks of the split document named by
+``data.split_file`` (default ``data/splits_670_150_180.json``: Train-670; Val-150 and Hard-180 are blocked; the
+v1 file ``data/splits_700_150_150.json`` can still be named explicitly). Every other id (val / holdout = Hard-180 /
+eval / any non-ARC id) is dropped, and a kept episode outside the allowlist raises.
 
-* episodes of the 700 re-split *train* tasks, plus
-* episodes whose task id is not an official ARC task at all (``sdg_hard`` synthetic-verified tasks),
+``sdg_hard`` is refused (``EvalLeakError``) unless ``stages.B.allow_sdg_hard: true``: 143 of its 228 puzzles were
+written from NVARC mix summaries whose parents include public-eval tasks (and 95 from val / holdout parents; see
+docs/REVIEW_2026-09-26.json). Even with the flag, an sdg puzzle is kept only when its id is listed in
+``stages.B.sdg_allowlist`` (ids whose NVARC parents are both 700-split train tasks; empty by default).
 
-and never ``eval_public`` (the file is never opened; rows labelled ``eval_public`` or carrying an eval / val /
-holdout task id raise or are dropped). Rare families are oversampled by weighted sampling *without
+``eval_public`` is never read (the file is never opened; rows labelled ``eval_public`` raise). Rare families are
+oversampled by weighted sampling *without
 replacement* inside each epoch (weight = family_count^-alpha), so a rare-family episode is never duplicated
 within an epoch; the augmented / regenerated variants supply the extra rare-family volume. Loss = the JEPA
 terms (no program terms), lr 3e-5.
@@ -27,7 +32,9 @@ from arcjepa.training.common import (RealEpisodeDataset, StageSpec, TrainContext
 log = logging.getLogger(__name__)
 
 STAGE = "B"
-DEFAULT_CONFIGS: Tuple[str, ...] = ("episodes", "episodes_aug", "arcgen_fresh", "sdg_hard")
+DEFAULT_CONFIGS: Tuple[str, ...] = ("episodes", "episodes_aug", "arcgen_fresh")
+#: configs whose puzzles derive from evaluation / val / holdout parents: refused unless explicitly allowed
+LEAKY_CONFIGS: Tuple[str, ...] = ("sdg_hard",)
 TRAIN_HF_SPLITS: Tuple[str, ...] = ("train", "val", "test")
 _TID_RE = re.compile(r'"task_id"\s*:\s*"([^"]+)"')
 
@@ -107,30 +114,55 @@ def family_weights(families: Sequence[str], alpha: float = 0.5) -> List[float]:
     return [float(counts[f]) ** (-float(alpha)) for f in families]
 
 
+def stage_b_configs(bcfg: Mapping[str, Any]) -> Tuple[List[str], Set[str]]:
+    """``(episode configs, explicit sdg allowlist)`` of a ``stages.B`` block.
+
+    Raises :class:`EvalLeakError` when a leaky config (``sdg_hard``) is requested without
+    ``allow_sdg_hard: true``. With the flag, only the ids in ``sdg_allowlist`` may pass (empty = none).
+    """
+    configs = list(bcfg.get("configs") or DEFAULT_CONFIGS)
+    leaky = [c for c in configs if c in LEAKY_CONFIGS]
+    allow: Set[str] = set()
+    if leaky:
+        if not bool(bcfg.get("allow_sdg_hard", False)):
+            raise EvalLeakError(
+                f"stage B refuses {leaky}: its puzzles were written from NVARC mixes with public-eval / val / "
+                "holdout parents (docs/REVIEW_2026-09-26.json). Set stages.B.allow_sdg_hard=true together with "
+                "stages.B.sdg_allowlist (ids whose parents are both 700-split train tasks) to opt in.")
+        allow = {str(t) for t in (bcfg.get("sdg_allowlist") or [])}
+        if not allow:
+            log.warning("stage B: allow_sdg_hard is set but sdg_allowlist is empty; every sdg row is dropped")
+    return configs, allow
+
+
 def load_real_data(cfg: Mapping[str, Any]) -> Tuple[List[Episode], List[str], List[Episode]]:
     """``(train_episodes, train_families, val_episodes)`` for stage B.
 
-    Train: every configured episode config over the HF train/val/test files, restricted to the 700 re-split
-    train tasks plus non-official (sdg) task ids. Val: canonical ``episodes`` of the 150 re-split val tasks
-    (model selection only).
+    Train: every configured episode config over the HF train/val/test files, restricted to an allowlist = the
+    train ids of the ``data.split_file`` document (default Train-670; plus an explicit sdg allowlist when
+    ``allow_sdg_hard`` is set). Val: canonical ``episodes`` of the 150 val tasks (model selection only).
     """
     from arcjepa.data.hf_loader import EVAL_PUBLIC, load_resplit, resolve_root
 
     bcfg = cfg_get(cfg, "stages.B", {}) or {}
+    configs, sdg_allow = stage_b_configs(bcfg)
     root = resolve_root(cfg_get(cfg, "data.root"))
-    splits = load_resplit(root)
+    splits = load_resplit(root, cfg_get(cfg, "data.split_file"))
     train_ids: Set[str] = set(splits["train"])
     val_ids: Set[str] = set(splits["val"])
     official = official_task_splits(root)
     eval_ids = {t for t, s in official.items() if s == EVAL_PUBLIC}
     if train_ids & eval_ids:
-        raise EvalLeakError("the 700 train split contains eval_public ids")
+        raise EvalLeakError("the train split contains eval_public ids")
     blocked = eval_ids | set(splits["val"]) | set(splits["holdout"])
+    if train_ids & blocked:
+        raise EvalLeakError("the train split overlaps val / holdout (Hard-180) / eval_public")
+    # allowlist: the split's train ids; explicit sdg ids only when opted in (never an official ARC id)
+    allowed: Set[str] = train_ids | {t for t in sdg_allow if t not in official}
 
     def keep(tid: str) -> bool:
-        return tid in train_ids or (tid not in official and tid not in blocked)
+        return tid in allowed
 
-    configs = list(bcfg.get("configs") or DEFAULT_CONFIGS)
     hf_splits = [s for s in (bcfg.get("hf_splits") or TRAIN_HF_SPLITS) if s != EVAL_PUBLIC]
     cap = bcfg.get("max_per_config")
     episodes: List[Episode] = []
@@ -144,8 +176,8 @@ def load_real_data(cfg: Mapping[str, Any]) -> Tuple[List[Episode], List[str], Li
         log.info("stage B: %d episodes from %s", len(got), conf)
         episodes += got
     for ep in episodes:
-        if ep.task_id in blocked:
-            raise EvalLeakError(f"episode {ep.episode_id} of a blocked task entered stage B")
+        if ep.task_id in blocked or ep.task_id not in allowed:
+            raise EvalLeakError(f"episode {ep.episode_id} (task {ep.task_id}) is outside the stage B allowlist")
 
     fams_official = load_split_families(root, sorted(train_ids))
     cache: Dict[str, str] = {}

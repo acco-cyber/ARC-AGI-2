@@ -69,7 +69,8 @@ class ObjectEncoder(nn.Module):
         mask = mask.bool()
         shape_all = feats.new_zeros(b, n, self.cfg.shape_dim)
         if bool(mask.any()):
-            shape_all[mask] = self.shape(crops[mask])
+            # under bf16 autocast the CNN returns bf16 while shape_all is fp32; index_put needs equal dtypes
+            shape_all[mask] = self.shape(crops[mask]).to(shape_all.dtype)
         tok = self.in_proj(torch.cat([shape_all, feats.to(shape_all.dtype)], dim=-1))
         # crop the slot axis to the last valid slot in the batch (objects are padded at the end)
         last = int((mask.long() * torch.arange(1, n + 1, device=mask.device)).max().item())

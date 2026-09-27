@@ -6,7 +6,9 @@ kept; with the uniform prior the proposal with the lowest demo loss is kept inst
 ``F = -10 E_demo + s_neural - 0.15 C(p)`` with ``E_demo`` realised as L_demo (wrong pairs + cell fraction, see
 :mod:`arcjepa.search.candidate`).  Parents are chosen by size-3 tournaments; the best eighth of the population is
 carried over unchanged (elitism).  Every program is verified exactly with the interpreter and evaluations are
-memoised by canonical form.
+memoised by canonical form.  A generation keeps at most one program per demo behaviour (its outputs on the
+demos), like the beam's observational-equivalence merge: no-op wrappers of a member would otherwise crowd the
+population out.  Guided proposals are stratified by edit kind (one literal change, one op swap, ...).
 """
 from __future__ import annotations
 
@@ -18,10 +20,10 @@ from typing import Any, Dict, List, Optional, Sequence, Union
 from arcjepa.core.types import Pair
 from arcjepa.dsl.ast import Node
 from arcjepa.dsl.grammar import random_program
-from arcjepa.dsl.mutations import crossover, mutate
+from arcjepa.dsl.mutations import MUTATION_KINDS, crossover, mutate
 
 from .candidate import (ALPHA, BETA, GAMMA, Candidate, Prior, canonical_key, make_candidate, sort_candidates)
-from .verifier import total_cells
+from .verifier import past_search_deadline, total_cells
 
 __all__ = ["evolve"]
 
@@ -75,6 +77,8 @@ def evolve(pairs: Sequence[Pair], seeds: Sequence[Union[Node, Candidate]], prior
         if c is None:
             c = make_candidate(prog, pairs, neural=neural_of([prog])[0], source=source, alpha=alpha, beta=beta,
                                gamma=gamma, n_cells=n_cells)
+            if past_search_deadline():
+                raise _Timeout  # executions may have been cut short by the solver's deadline: do not cache
             cache[key] = c
             st["evo_evaluations"] += 1
         if all(o is None for o in (c.outputs or [None])):
@@ -109,6 +113,7 @@ def evolve(pairs: Sequence[Pair], seeds: Sequence[Union[Node, Candidate]], prior
             if early_stop and population[0].demo_err == 0:
                 break
             nxt: List[Candidate] = list(population[:n_elite])
+            behaviours = {_behaviour(c) for c in nxt}
             attempts = 0
             while len(nxt) < pop and attempts < 4 * pop:
                 attempts += 1
@@ -123,8 +128,13 @@ def evolve(pairs: Sequence[Pair], seeds: Sequence[Union[Node, Candidate]], prior
                 else:
                     child = random_program(rng, rng.choice(list(init_depths)))
                 c = evaluate(child)
-                if c is not None:
-                    nxt.append(c)
+                if c is None:
+                    continue
+                b = _behaviour(c)
+                if b in behaviours:  # observationally equivalent to a member (e.g. a no-op wrapper): skip it
+                    continue
+                behaviours.add(b)
+                nxt.append(c)
             population = nxt
             st["evo_generations"] += 1
     except _Timeout:
@@ -133,13 +143,23 @@ def evolve(pairs: Sequence[Pair], seeds: Sequence[Union[Node, Candidate]], prior
     return sort_candidates(cache.values())[:max_results]
 
 
+def _behaviour(c: Candidate) -> Any:
+    """Observational-equivalence key of a candidate: its demo outputs (failed executions as ``None``)."""
+    return tuple(None if o is None else tuple(tuple(r) for r in o) for o in (c.outputs or ()))
+
+
 def _guided_mutation(rng: random.Random, prog: Node, n: int, prior: Optional[Prior], neural_of: Any,
                      evaluate: Any) -> Node:
-    """Propose ``n`` mutations; keep the prior's favourite (or the lowest-loss one under the uniform prior)."""
+    """Propose ``n`` mutations; keep the prior's favourite (or the lowest-loss one under the uniform prior).
+
+    Proposals are stratified by edit kind (:data:`arcjepa.dsl.mutations.MUTATION_KINDS`, cycled from a random
+    start), so every guided step tries a literal change, an op swap, a subtree replacement, ... instead of
+    ``n`` edits of whatever kinds a uniform draw happens to repeat."""
     props: List[Node] = []
     seen = set()
-    for _ in range(max(1, n)):
-        m = mutate(rng, prog)
+    start = rng.randrange(len(MUTATION_KINDS))
+    for i in range(max(1, n)):
+        m = mutate(rng, prog, MUTATION_KINDS[(start + i) % len(MUTATION_KINDS)])
         k = m.to_str()
         if k not in seen:
             seen.add(k)

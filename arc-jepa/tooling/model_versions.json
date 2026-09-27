@@ -1,0 +1,10 @@
+[
+ {
+  "version": "v1",
+  "date": "2026-09-27",
+  "public_eval": "0.0083 (1/172 outputs; 0 tasks with an exact-fit program; 48 near misses >= 90% cells)",
+  "val150": "0.12 (18/150, symbolic search at 20 s/task, model=None; same code family)",
+  "params": "0.56M (debug config)",
+  "notes": "Smoke-trained debug model (0.56M params, 20 steps per stage) as the prior of the 72-op typed DSL search. Pipeline validation release: measured 0.0083 on the 120"
+ }
+]

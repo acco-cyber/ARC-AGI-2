@@ -39,12 +39,12 @@ from arcjepa.dsl.canonicalize import canonicalize
 from arcjepa.dsl.interpreter import ExecError, execute
 from arcjepa.dsl.primitives import REGISTRY
 from arcjepa.dsl.types import T
-from arcjepa.synthetic.generators import STYLE_WEIGHTS, random_input_grid, random_palette
+from arcjepa.synthetic.generators import STYLE_WEIGHTS, random_input_grid, random_palette, shaped_input_grid
 from arcjepa.synthetic.program_sampler import sample_category, sample_depth, sample_program
 
 __all__ = [
     "SynthTask", "HELDOUT_COMPOSITIONS", "SPLIT_RULES", "EXEC_TIMEOUT_S", "CHUNK_SIZE", "make_task",
-    "make_task_with_reason", "generate", "split_of", "difficulty_score", "count_cc4", "task_difficulty", "degeneracy_reason", "execute_pairs",
+    "make_task_with_reason", "input_shape_hint", "generate", "split_of", "difficulty_score", "count_cc4", "task_difficulty", "degeneracy_reason", "execute_pairs",
     "program_colors", "task_to_row", "row_to_task", "iter_rows", "load_jsonl", "to_arc_task", "main",
 ]
 
@@ -251,6 +251,39 @@ def _choose_style(rng: random.Random) -> str:
     return rng.choices(styles, weights=[STYLE_WEIGHTS[s] for s in styles])[0]
 
 
+def _int_literal(prog: Node, op: str) -> Optional[int]:
+    """The INTEGER literal of the first ``op`` node of ``prog`` (pre-order), if it is a raw literal."""
+    for _, n in prog.iter_nodes():
+        if n.op == op and len(n.args) > 1 and isinstance(n.args[1], int) and not isinstance(n.args[1], bool):
+            return int(n.args[1])
+    return None
+
+
+def input_shape_hint(prog: Node) -> Optional[Tuple[str, Optional[int]]]:
+    """``(hint, k)`` for :func:`arcjepa.synthetic.generators.shaped_input_grid` when ``prog`` contains a spec
+    extension that random ARC-like inputs almost never satisfy, else ``None`` (inputs are drawn as usual).
+
+    Priority: KRON_SELF (sides <= 5) > DOWNSCALE / DOWNSCALE_ANY (block-structured, k from the literal) > panel
+    ops (separated panels; a PANEL_OVERLAY order literal ``o`` needs more than ``o / 2`` panels, so k is that
+    minimum panel count) > UPSCALE / UPSCALE_NC (small sides).
+    """
+    ops = prog.primitives()
+    if "KRON_SELF" in ops:
+        return "kron", None
+    if "DOWNSCALE" in ops:
+        return "blocks", _int_literal(prog, "DOWNSCALE")
+    if "DOWNSCALE_ANY" in ops:
+        return "blocks_any", _int_literal(prog, "DOWNSCALE_ANY")
+    if "PANEL_BOOL" in ops or "PANEL_OVERLAY" in ops:
+        order = _int_literal(prog, "PANEL_OVERLAY")
+        return "panels", (None if order is None else min(4, order // 2 + 1))
+    if "UPSCALE" in ops:
+        return "small", _int_literal(prog, "UPSCALE")
+    if "UPSCALE_NC" in ops:
+        return "small", 4
+    return None
+
+
 def make_task_with_reason(rng: random.Random, *, n_pairs: Tuple[int, int] = (3, 6),
                           category: Optional[str] = None, depth: Optional[int] = None,
                           program: Union[Node, str, None] = None, task_id: Optional[str] = None
@@ -272,12 +305,16 @@ def make_task_with_reason(rng: random.Random, *, n_pairs: Tuple[int, int] = (3, 
     lits = [c for c in program_colors(prog) if c != bg][:3]
     palette = random_palette(rng, bg, include=lits)
     style = _choose_style(rng)
+    hint = input_shape_hint(prog)
     lo, hi = n_pairs
     k = rng.randint(lo, hi)
     pairs: List[Pair] = []
     fails = 0
     while len(pairs) < k:
-        g = random_input_grid(rng, style=style, palette=palette, background=bg)
+        if hint is None:
+            g = random_input_grid(rng, style=style, palette=palette, background=bg)
+        else:
+            g = shaped_input_grid(rng, hint[0], palette=palette, background=bg, style=style, k=hint[1])
         try:
             out = execute(prog, g, timeout_s=EXEC_TIMEOUT_S)
         except ExecError:
@@ -392,9 +429,11 @@ def _chunk_rng(seed: int, chunk: int) -> random.Random:
 
 
 def _gen_chunk(args: Tuple[int, int, int, str, Tuple[int, int]]) -> Tuple[List[str], Dict[str, int]]:
-    """Worker: generate ``count`` tasks for chunk ``chunk`` -> (JSONL lines, counters incl. ``compute_us``)."""
+    """Worker: generate ``count`` tasks for chunk ``chunk`` -> (JSONL lines, counters incl. ``compute_us`` (wall)
+    and ``cpu_us`` (this process's CPU time))."""
     seed, chunk, count, split_rule, n_pairs = args
     t0 = time.perf_counter()
+    c0 = time.process_time()
     rng = _chunk_rng(seed, chunk)
     stats: Counter = Counter()
     lines: List[str] = []
@@ -420,6 +459,7 @@ def _gen_chunk(args: Tuple[int, int, int, str, Tuple[int, int]]) -> Tuple[List[s
         stats["adversarial"] += int(task.adversarial)
         lines.append(json.dumps(task_to_row(task, split), separators=(",", ":")))
     stats["compute_us"] += int((time.perf_counter() - t0) * 1e6)
+    stats["cpu_us"] += int((time.process_time() - c0) * 1e6)
     return lines, dict(stats)
 
 
@@ -430,8 +470,10 @@ def generate(n: int, out_path: str, seed: int, workers: int = 1, split_rule: str
     Output is deterministic in ``(n, seed, split_rule, n_pairs, chunk_size)`` and independent of ``workers``.
 
     Returns counters: ``n``, ``train``, ``val_comp``, ``attempts``, ``reject_<reason>``, ``depth_<d>``,
-    ``category_<c>``, ``adversarial``, ``elapsed_ms`` (wall), ``compute_ms`` (summed worker time),
-    ``tasks_per_s`` (wall) and ``tasks_per_s_per_worker`` (n / summed worker seconds).
+    ``category_<c>``, ``adversarial``, ``elapsed_ms`` (wall), ``compute_ms`` (summed worker wall time),
+    ``cpu_ms`` (summed worker CPU time), ``tasks_per_s`` (wall) and ``tasks_per_s_per_worker`` (n / summed worker
+    CPU seconds: the per-core throughput, independent of how many other processes share the machine; falls back
+    to the worker wall time when the CPU clock reports nothing).
     """
     if n < 0:
         raise ValueError("n must be >= 0")
@@ -458,12 +500,15 @@ def generate(n: int, out_path: str, seed: int, workers: int = 1, split_rule: str
                     totals.update(st)
     elapsed = time.perf_counter() - t0
     out: Dict[str, int] = {"n": n, "train": 0, "val_comp": 0}
-    out.update({k: int(v) for k, v in totals.items() if k != "compute_us"})
+    out.update({k: int(v) for k, v in totals.items() if k not in ("compute_us", "cpu_us")})
     compute_s = totals.get("compute_us", 0) / 1e6
+    cpu_s = totals.get("cpu_us", 0) / 1e6
     out["elapsed_ms"] = int(elapsed * 1000)
     out["compute_ms"] = int(compute_s * 1000)
+    out["cpu_ms"] = int(cpu_s * 1000)
     out["tasks_per_s"] = int(n / elapsed) if elapsed > 0 else 0
-    out["tasks_per_s_per_worker"] = int(n / compute_s) if compute_s > 0 else 0
+    per_worker_s = cpu_s if cpu_s > 0 else compute_s
+    out["tasks_per_s_per_worker"] = int(n / per_worker_s) if per_worker_s > 0 else 0
     log.info("generated %d tasks -> %s (%s)", n, out_path, out)
     return out
 

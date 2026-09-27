@@ -1,0 +1,95 @@
+{
+ "format": "arcjepa-package-v1",
+ "model": {
+  "name": "tiny",
+  "cell_dim": 64,
+  "object_dim": 64,
+  "relation_dim": 64,
+  "global_dim": 96,
+  "jepa_dim": 64,
+  "rule_dim": 64,
+  "program_dim": 64,
+  "predictor_dim": 64,
+  "cell_layers": 2,
+  "object_layers": 2,
+  "relation_layers": 2,
+  "predictor_layers": 2,
+  "program_layers": 2,
+  "heads": 4,
+  "ffn_dim": 128,
+  "predictor_ffn_dim": 128,
+  "dropout": 0.0,
+  "cell_part_dim": 8,
+  "max_side": 30,
+  "n_colors": 10,
+  "pad_id": 10,
+  "max_objects": 64,
+  "obj_feat_dim": 32,
+  "shape_conv_dim": 16,
+  "shape_dim": 32,
+  "rel_feat_dim": 24,
+  "edge_dim": 16,
+  "max_pairs": 128,
+  "fusion_hidden": 128,
+  "rule_hidden": [
+   128,
+   64
+  ],
+  "scorer_hidden": [
+   128,
+   64
+  ],
+  "max_program_len": 96,
+  "program_depth_tokens": 16,
+  "program_sym_dim": 32,
+  "program_aux_dim": 16,
+  "max_ctx": 10,
+  "ema_start": 0.996,
+  "ema_end": 0.9995,
+  "extra": {}
+ },
+ "weights": "model.safetensors",
+ "vocab": "vocab.json",
+ "memory": {
+  "npz": "program_memory.npz",
+  "programs": "programs.json",
+  "size": 28,
+  "dim": 64,
+  "top_k": 16,
+  "sources": "synthetic train split + 700 re-split training tasks (never evaluation)"
+ },
+ "search": {
+  "beam_width": 64,
+  "max_depth": 6,
+  "top_primitives": 8,
+  "astar_max_nodes": 50000
+ },
+ "tta": {
+  "enabled": true,
+  "steps": 8,
+  "lr": 0.05,
+  "anchor_weight": 0.1
+ },
+ "repair": {
+  "enabled": true,
+  "max_rounds": 4
+ },
+ "outputs": {
+  "num_candidates": 2
+ },
+ "training": {
+  "config_path": "/kaggle/working/arc-jepa/configs/debug.yaml",
+  "seed": 7
+ },
+ "created_unix": 1790434134,
+ "n_parameters": 557041,
+ "training_summary": {
+  "completed": [
+   "A",
+   "B",
+   "C",
+   "D"
+  ],
+  "global_step": 80
+ }
+}

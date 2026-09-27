@@ -16,10 +16,10 @@ from typing import Dict, List
 import pytest
 
 from arcjepa.core.types import Grid, validate_grid
-from arcjepa.dsl import (HARD_NEGATIVE_TYPES, INPUT, OBJ, REGISTRY, SPEC_PRIMITIVES, STRUCTURAL_PRIMITIVES,
-                         DSLTypeError, ExecError, Node, Object, T, by_out_type, canonicalize, crossover,
-                         enumerate_programs, evaluate, execute, expansions, hard_negatives, mutate, random_program,
-                         structural_signature, typecheck)
+from arcjepa.dsl import (EXTENSION_PRIMITIVES, HARD_NEGATIVE_TYPES, INPUT, OBJ, REGISTRY, SPEC_PRIMITIVES,
+                         STRUCTURAL_PRIMITIVES, DSLTypeError, ExecError, Node, Object, T, by_out_type, canonicalize,
+                         crossover, enumerate_programs, evaluate, execute, expansions, hard_negatives, mutate,
+                         random_program, structural_signature, typecheck)
 from arcjepa.dsl.canonicalize import D4_TABLE, GEOMETRIC_OPS
 from arcjepa.dsl.grammar import DEPTH_MIX, can_host, sample_depth
 from arcjepa.dsl.interpreter import value_type_ok
@@ -112,6 +112,13 @@ def test_registry_has_exactly_the_72_spec_primitives() -> None:
             assert not REGISTRY[n].structural
     for n in STRUCTURAL_PRIMITIVES:
         assert REGISTRY[n].structural and n not in expected
+    # spec extensions (INTERFACES.md §1): outside the 72, never structural, and nothing else is registered
+    assert set(EXTENSION_PRIMITIVES) == {"UPSCALE", "DOWNSCALE", "DOWNSCALE_ANY", "KRON_SELF", "UPSCALE_NC",
+                                         "PANEL_BOOL", "PANEL_OVERLAY", "CONNECT_SAME", "FILL_EMPTY_LINES",
+                                         "BBOX_FILL"}
+    for n in EXTENSION_PRIMITIVES:
+        assert REGISTRY[n].extension and not REGISTRY[n].structural and n not in expected
+    assert set(REGISTRY) == set(expected) | set(STRUCTURAL_PRIMITIVES) | set(EXTENSION_PRIMITIVES)
 
 
 def test_spec_signature_examples() -> None:
@@ -137,7 +144,8 @@ _OS = "(GET_COMPONENTS4 INPUT)"
 _L = f"(SELECT_LARGEST {_OS})"
 _S = f"(SELECT_SMALLEST {_OS})"
 
-#: One expression per registered op whose ROOT is that op (72 spec primitives + structural helpers).
+#: One expression per registered op whose ROOT is that op (72 spec primitives + structural helpers + spec
+#: extensions).
 PRIMITIVE_EXAMPLES: Dict[str, str] = {
     "SELECT_ALL": "(SELECT_ALL INPUT)",
     "SELECT_COLOR": f"(SELECT_COLOR {_OS} (ARGMAX_SIZE {_OS}))",
@@ -215,6 +223,57 @@ PRIMITIVE_EXAMPLES: Dict[str, str] = {
     "RENDER_OBJ": f"(RENDER_OBJ (RECOLOR {_L} 2) INPUT)",
     "RENDER_BLANK": f"(RENDER_BLANK {_OS} INPUT)",
     "CROP": f"(CROP INPUT {_L})",
+    # spec extensions
+    "UPSCALE": "(UPSCALE INPUT 2)",
+    "DOWNSCALE": "(DOWNSCALE INPUT 2)",
+    "DOWNSCALE_ANY": "(DOWNSCALE_ANY INPUT 2)",
+    "KRON_SELF": "(KRON_SELF INPUT)",
+    "UPSCALE_NC": "(UPSCALE_NC INPUT)",
+    "PANEL_BOOL": "(PANEL_BOOL INPUT 2 (MOST_COMMON_COLOR INPUT))",
+    "PANEL_OVERLAY": "(PANEL_OVERLAY INPUT 1)",
+    "CONNECT_SAME": "(CONNECT_SAME INPUT 0)",
+    "FILL_EMPTY_LINES": "(FILL_EMPTY_LINES INPUT 3)",
+    "BBOX_FILL": f"(BBOX_FILL INPUT (ARGMIN_SIZE {_OS}))",
+}
+
+
+def small_grid(rng: random.Random, lo: int = 2, hi: int = 5) -> Grid:
+    """Random grid with sides ``lo..hi`` and at least one non-zero cell (KRON_SELF squares the sides)."""
+    h, w = rng.randint(lo, hi), rng.randint(lo, hi)
+    g = [[rng.choice((0, 0, rng.randint(1, 9))) for _ in range(w)] for _ in range(h)]
+    g[rng.randrange(h)][rng.randrange(w)] = rng.randint(1, 9)
+    return g
+
+
+def panel_grid(rng: random.Random, n: int = 0) -> Grid:
+    """``n`` (2 or 3) equally shaped random panels side by side, joined by one-column separators of a colour that
+    does not occur inside the panels."""
+    n = n or rng.choice((2, 3))
+    ph, pw = rng.randint(3, 6), rng.randint(3, 6)
+    sep = rng.randint(1, 9)
+    inner = [c for c in range(1, 10) if c != sep]
+    panels = [[[rng.choice(inner) if rng.random() < 0.5 else 0 for _ in range(pw)] for _ in range(ph)]
+              for _ in range(n)]
+    rows: Grid = []
+    for r in range(ph):
+        row: List[int] = []
+        for i, p in enumerate(panels):
+            if i:
+                row.append(sep)
+            row.extend(p[r])
+        rows.append(row)
+    return rows
+
+
+#: Valid-input generators for ops whose domain is narrower than rect_grid's (they raise ExecError otherwise, by
+#: design): block downscaling needs sides divisible by the factor, KRON_SELF needs sides <= 5 (30 = 5 x 6 cap on
+#: the squared side), the panel ops need a panel structure.
+EXAMPLE_GRIDS = {
+    "DOWNSCALE": lambda rng: rect_grid(rng, rng.choice((10, 12, 14)), rng.choice((10, 12, 14))),
+    "DOWNSCALE_ANY": lambda rng: rect_grid(rng, rng.choice((10, 12, 14)), rng.choice((10, 12, 14))),
+    "KRON_SELF": small_grid,
+    "PANEL_BOOL": panel_grid,
+    "PANEL_OVERLAY": panel_grid,
 }
 
 
@@ -222,6 +281,7 @@ def test_examples_cover_every_registered_op() -> None:
     assert set(PRIMITIVE_EXAMPLES) == set(REGISTRY)
     for name, src in PRIMITIVE_EXAMPLES.items():
         assert Node.from_str(src).op == name
+    assert set(EXAMPLE_GRIDS) <= set(REGISTRY)
 
 
 @pytest.mark.parametrize("name", sorted(REGISTRY))
@@ -230,9 +290,10 @@ def test_every_primitive_typechecks_and_executes(name: str) -> None:
     prim = REGISTRY[name]
     assert typecheck(node) is prim.out_type
     rng = random.Random(1000 + sorted(REGISTRY).index(name))
+    make_grid = EXAMPLE_GRIDS.get(name, rect_grid)
     ok = 0
     for _ in range(4):
-        g = rect_grid(rng)
+        g = make_grid(rng)
         before = copy.deepcopy(g)
         val = evaluate(node, g)
         assert g == before, "primitives must not mutate their inputs"
@@ -466,6 +527,7 @@ def test_sampler_covers_most_primitives() -> None:
     for _ in range(1500):
         used |= random_program(rng).primitives()
     assert len(used & set(SPEC_PRIMITIVES)) >= 60, sorted(set(SPEC_PRIMITIVES) - used)
+    assert set(EXTENSION_PRIMITIVES) <= used, sorted(set(EXTENSION_PRIMITIVES) - used)
 
 
 def test_enumerate_programs_breadth_first_canonical_dedup() -> None:
@@ -679,3 +741,160 @@ def test_hand_written_arc_programs(name: str, src: str, pairs) -> None:
     for inp, want in pairs:
         assert execute(prog, inp) == want, name
         assert execute(canon, inp) == want, name  # canonical form is semantically identical
+
+
+# ======================================================================================= spec extensions
+
+def test_extension_scaling_semantics() -> None:
+    g = [[1, 2], [0, 3]]
+    assert run("(UPSCALE INPUT 2)", g) == [[1, 1, 2, 2], [1, 1, 2, 2], [0, 0, 3, 3], [0, 0, 3, 3]]
+    assert run("(UPSCALE INPUT 3)", [[4]]) == [[4, 4, 4]] * 3
+    # blocks [[1,1],[1,0]] / [[0,0],[0,3]] / [[1,2],[2,1]]: majority (ties -> larger colour) vs. any non-zero
+    blocks = [[1, 1, 0, 0, 1, 2], [1, 0, 0, 3, 2, 1]]
+    assert run("(DOWNSCALE INPUT 2)", blocks) == [[1, 0, 2]]
+    assert run("(DOWNSCALE_ANY INPUT 2)", blocks) == [[1, 3, 2]]
+    assert run("(DOWNSCALE INPUT 3)", [[5, 5, 0], [0, 5, 0], [0, 0, 0]]) == [[0]]
+    assert run("(DOWNSCALE_ANY INPUT 3)", [[5, 5, 0], [0, 5, 0], [0, 0, 0]]) == [[5]]
+    assert run("(KRON_SELF INPUT)", [[1, 0], [0, 2]]) == [[1, 0, 0, 0], [0, 2, 0, 0], [0, 0, 1, 0], [0, 0, 0, 2]]
+    assert run("(KRON_SELF INPUT)", [[3, 3, 0]]) == [[3, 3, 0, 3, 3, 0, 0, 0, 0]]
+    assert run("(UPSCALE_NC INPUT)", [[1, 0], [0, 2]]) == [[1, 1, 0, 0], [1, 1, 0, 0], [0, 0, 2, 2], [0, 0, 2, 2]]
+    assert run("(UPSCALE_NC INPUT)", [[5, 5]]) == [[5, 5]]  # one colour: factor 1
+    big = [[1] * 16 for _ in range(16)]
+    for bad, grid in [("(UPSCALE INPUT 2)", big),                    # 32 > 30
+                      ("(UPSCALE INPUT 1)", g),                      # literal outside the factor domain 2..5
+                      ("(UPSCALE INPUT (COUNT_OBJECTS (GET_COMPONENTS4 INPUT)))", [[0, 0], [0, 0]]),  # factor 0
+                      ("(DOWNSCALE INPUT 2)", [[1, 2, 3, 4], [1, 2, 3, 4], [1, 2, 3, 4]]),  # 3 rows, k 2
+                      ("(DOWNSCALE_ANY INPUT 3)", [[1, 2], [3, 4]]),
+                      ("(KRON_SELF INPUT)", [[1] * 6 for _ in range(6)]),  # 36 > 30
+                      ("(UPSCALE_NC INPUT)", [[0, 0]])]:                  # no colour
+        with pytest.raises(ExecError):
+            run(bad, grid)
+
+
+#: Two 3x2 panels separated by a column of 5: A = [[1,0],[0,1],[1,0]], B = [[1,1],[0,0],[0,1]].
+_PANELS = [[1, 0, 5, 1, 1], [0, 1, 5, 0, 0], [1, 0, 5, 0, 1]]
+
+
+@pytest.mark.parametrize("op,want", [
+    (0, [[1, 0], [0, 0], [0, 0]]),   # AND
+    (1, [[1, 1], [0, 1], [1, 1]]),   # OR
+    (2, [[0, 1], [0, 1], [1, 1]]),   # XOR
+    (3, [[0, 0], [1, 0], [0, 0]]),   # NOR
+    (4, [[0, 0], [0, 1], [1, 0]]),   # FIRST_ONLY: A and not B
+    (5, [[0, 1], [0, 0], [0, 1]]),   # LAST_ONLY: B and not A
+])
+def test_extension_panel_bool_semantics(op: int, want: Grid) -> None:
+    assert run(f"(PANEL_BOOL INPUT {op} 7)", _PANELS) == [[7 * v for v in row] for row in want]
+
+
+def test_extension_panel_splitting_and_overlay() -> None:
+    from arcjepa.dsl.primitives import grid_panels, panel_priority
+    # no separator lines: left / right halves when W >= 2H - 1, else top / bottom halves
+    assert grid_panels([[1, 0, 0, 2], [1, 1, 2, 0]]) == [[[1, 0], [1, 1]], [[0, 2], [2, 0]]]
+    assert run("(PANEL_BOOL INPUT 0 4)", [[1, 0, 0, 2], [1, 1, 2, 0]]) == [[0, 0], [4, 0]]
+    assert run("(PANEL_BOOL INPUT 0 9)", [[1, 2], [0, 3], [4, 0], [0, 5]]) == [[9, 0], [0, 9]]
+    with pytest.raises(ExecError):
+        run("(PANEL_BOOL INPUT 0 1)", [[1, 2, 3], [4, 5, 6], [7, 8, 9]])  # odd sides, no separators
+    with pytest.raises(ExecError):
+        REGISTRY["PANEL_BOOL"].fn(_PANELS, 6, 1)  # computed op outside 0..5
+    # overlay: the highest-priority panel's non-zero colour wins
+    p = [[1, 0, 5, 2, 2], [0, 1, 5, 0, 0], [1, 0, 5, 0, 2]]
+    first_wins = [[1, 2], [0, 1], [1, 2]]
+    second_wins = [[2, 2], [0, 1], [1, 2]]
+    assert run("(PANEL_OVERLAY INPUT 0)", p) == first_wins
+    assert run("(PANEL_OVERLAY INPUT 1)", p) == second_wins
+    assert run("(PANEL_OVERLAY INPUT 2)", p) == second_wins  # reverse of the rotation starting at panel 0
+    assert run("(PANEL_OVERLAY INPUT 3)", p) == first_wins
+    with pytest.raises(ExecError):
+        run("(PANEL_OVERLAY INPUT 4)", p)  # 2 panels have 4 orders
+    # 2n dihedral orders: all 6 permutations of 3 panels
+    assert [panel_priority(3, k) for k in range(6)] == [[0, 1, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0], [0, 2, 1],
+                                                        [1, 0, 2]]
+
+
+def test_extension_line_and_region_fill_semantics() -> None:
+    g = [[3, 0, 0, 3, 0], [0, 0, 0, 0, 0], [3, 0, 4, 0, 0]]
+    assert run("(CONNECT_SAME INPUT 0)", g) == [[3, 3, 3, 3, 0], [3, 0, 0, 0, 0], [3, 0, 4, 0, 0]]
+    assert run("(CONNECT_SAME INPUT 8)", g) == [[3, 8, 8, 3, 0], [8, 0, 0, 0, 0], [3, 0, 4, 0, 0]]
+    assert run("(CONNECT_SAME INPUT 8)", [[2, 2, 0], [0, 0, 0]]) == [[2, 2, 0], [0, 0, 0]]  # no gap
+    assert run("(CONNECT_SAME INPUT 8)", [[2, 1, 2], [0, 0, 0]]) == [[2, 1, 2], [0, 0, 0]]  # blocked
+    f = [[1, 1, 1, 1], [1, 0, 0, 1], [1, 0, 2, 1], [1, 1, 1, 1]]
+    assert run("(FILL_EMPTY_LINES INPUT 3)", f) == [[1, 1, 1, 1], [1, 3, 3, 1], [1, 3, 2, 1], [1, 1, 1, 1]]
+    assert run("(FILL_EMPTY_LINES INPUT 3)", [[0, 0, 0], [0, 1, 0]]) == [[0, 0, 0], [0, 1, 0]]  # thinner than 3
+    b = [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 0, 2], [0, 0, 2, 2]]
+    assert run("(BBOX_FILL INPUT 5)", b) == [[1, 5, 0, 0], [5, 1, 0, 0], [0, 0, 5, 2], [0, 0, 2, 2]]
+    assert run("(BBOX_FILL INPUT 5)", [[1, 2], [0, 3]]) == [[1, 2], [5, 3]]  # colour-agnostic components
+    for bad in ("(FILL_EMPTY_LINES INPUT 0)", "(BBOX_FILL INPUT 0)"):  # colour 0 would be a no-op
+        with pytest.raises(ExecError):
+            run(bad, f)
+
+
+_D4 = ("ROTATE90", "ROTATE180", "ROTATE270", "REFLECT_H", "REFLECT_V", "REFLECT_D1", "REFLECT_D2")
+
+
+def test_extension_canonical_rules_are_sound() -> None:
+    c = canonicalize
+    P = Node.from_str
+    assert c(P("(DOWNSCALE (UPSCALE INPUT 3) 3)")) == INPUT
+    assert c(P("(DOWNSCALE_ANY (UPSCALE INPUT 2) 2)")) == INPUT
+    assert c(P("(UPSCALE (UPSCALE INPUT 2) 2)")) == P("(UPSCALE INPUT 4)")
+    assert c(P("(UPSCALE (UPSCALE INPUT 2) 3)")) == P("(UPSCALE (UPSCALE INPUT 2) 3)")  # 6 is not a literal
+    assert c(P("(UPSCALE INPUT (COUNT_OBJECTS (SELECT_ALL INPUT)))")) == P("(UPSCALE_NC INPUT)")
+    assert c(P("(FILL_EMPTY_LINES (FILL_EMPTY_LINES INPUT 3) 4)")) == P("(FILL_EMPTY_LINES INPUT 3)")
+    assert c(P("(BBOX_FILL (ROTATE90 INPUT) 2)")) == P("(ROTATE90 (BBOX_FILL INPUT 2))")
+    assert c(P("(ROTATE270 (UPSCALE (ROTATE90 INPUT) 2))")) == P("(UPSCALE INPUT 2)")
+    assert c(P("(KRON_SELF (REFLECT_H INPUT))")) == P("(REFLECT_H (KRON_SELF INPUT))")
+    # left alone: order-dependent ops, and computed arguments (moving the D4 op out would add a level)
+    for src in ("(CONNECT_SAME (ROTATE90 INPUT) 3)", "(PANEL_BOOL (ROTATE90 INPUT) 0 2)",
+                "(PANEL_OVERLAY (REFLECT_H INPUT) 1)", "(BBOX_FILL (ROTATE90 INPUT) (MOST_COMMON_COLOR INPUT))"):
+        assert c(P(src)) == P(src), src
+    rng = random.Random(31)
+    grids = [small_grid(rng, 2, 6) for _ in range(6)] + [[[1, 1, 0, 0], [1, 0, 0, 3], [2, 2, 0, 3], [2, 0, 0, 0]]]
+    progs = ["(DOWNSCALE (UPSCALE INPUT 3) 3)", "(DOWNSCALE_ANY (UPSCALE INPUT 2) 2)", "(UPSCALE (UPSCALE INPUT 2) 2)",
+             "(UPSCALE INPUT (COUNT_OBJECTS (SELECT_ALL INPUT)))", "(FILL_EMPTY_LINES (FILL_EMPTY_LINES INPUT 3) 4)",
+             "(BBOX_FILL (ROTATE90 INPUT) 2)", "(ROTATE270 (UPSCALE (ROTATE90 INPUT) 2))",
+             "(KRON_SELF (REFLECT_H INPUT))"]
+    checked = 0
+    for src in progs:
+        prog = P(src)
+        for g in grids:
+            try:
+                want = execute(prog, g)
+            except ExecError:
+                continue
+            assert execute(c(prog), g) == want, (src, g)
+            checked += 1
+    assert checked >= 30
+    # the D4-equivariance the move-outside rule relies on: op(D(g)) == D(op(g)) for every D4 op
+    for op_src in ("(UPSCALE {} 2)", "(DOWNSCALE {} 2)", "(DOWNSCALE_ANY {} 2)", "(UPSCALE_NC {})", "(KRON_SELF {})",
+                   "(BBOX_FILL {} 4)", "(FILL_EMPTY_LINES {} 4)"):
+        for d in _D4:
+            for g in grids + [[[1, 2, 0, 0], [3, 3, 0, 1]]]:
+                try:
+                    want = execute(P(f"({d} {op_src.format('INPUT')})"), g)
+                except ExecError:
+                    continue
+                assert execute(P(op_src.format(f"({d} INPUT)")), g) == want, (op_src, d, g)
+
+
+def test_extensions_are_seen_by_grammar_enumerator_and_mutations() -> None:
+    ext = set(EXTENSION_PRIMITIVES)
+    assert ext <= {p.name for p in expansions(T.GRID, 1)}
+    roots = {p.op for p in enumerate_programs(1, 3000)}
+    assert ext <= roots, ext - roots
+    for n in ext:  # typed GRID -> GRID search primitives: the GRID argument comes first
+        assert REGISTRY[n].out_type is T.GRID and REGISTRY[n].arg_types[0] is T.GRID
+    # an op swap moves literals into the new op's domain: REPEAT_X(g, 1) -> UPSCALE(g, 2) (factors 2..5)
+    rng = random.Random(12)
+    src = Node.from_str("(REPEAT_X INPUT 1)")
+    swapped = {mutate(rng, src, "swap_op").to_str() for _ in range(300)}
+    assert "(UPSCALE INPUT 2)" in swapped and "(DOWNSCALE INPUT 2)" in swapped, swapped
+    assert all(typecheck(Node.from_str(s)) is T.GRID for s in swapped)
+    # hard negatives of an extension program stay typed and distinct
+    pos = Node.from_str("(MIRROR_TILE (PANEL_BOOL INPUT 1 (MOST_COMMON_COLOR INPUT)))")
+    typed = hard_negatives_typed(random.Random(3), pos, k=8)
+    assert len(typed) >= 6
+    keys = {canonicalize(pos).to_str()}
+    for _, neg in typed:
+        assert typecheck(neg) is T.GRID and canonicalize(neg).to_str() not in keys
+        keys.add(canonicalize(neg).to_str())

@@ -14,7 +14,11 @@ training kernel ``poby7722/arc-jepa-train`` whose output holds ``arc_jepa_pkg``)
   dataset's ``tasks/eval_public.jsonl``), scores them with ``arcjepa.eval.evaluate`` and prints the competition
   metric; the test challenges' submission reuses the dev attempts for overlapping ids;
 * validates the final file with the logic of ``kaggle/validate_submission.py`` (inlined) and repairs any
-  malformed entry from the fallbacks.
+  malformed entry from the fallbacks;
+* **dev gate** (dev / commit runs only, never in a competition rerun): the last cell raises when the code dataset
+  is missing or does not import, no trained package is found, the package is a debug-config (smoke) package, or
+  no solver process could load it, so a broken version fails its commit and cannot be submitted. In rerun mode
+  the notebook never fails on these (the fallback / symbolic submission stands).
 
 Usage: ``python kaggle/build_infer_nb.py [--out-dir kaggle]``.
 """
@@ -39,7 +43,6 @@ def _load_train_builder() -> Any:
 _tb = _load_train_builder()
 code_cell, markdown_cell, notebook = _tb.code_cell, _tb.markdown_cell, _tb.notebook
 kernel_metadata, write_json = _tb.kernel_metadata, _tb.write_json
-CODE_SETUP_SRC = _tb.CODE_SETUP_SRC
 OWNER = _tb.OWNER
 TRAIN_KERNEL = f"{OWNER}/{_tb.TRAIN_SLUG}"
 INFER_SLUG = "arc-jepa-infer"
@@ -69,10 +72,14 @@ rewritten every 60 s, so a valid submission always exists.
 * Competition rerun (`KAGGLE_IS_COMPETITION_RERUN`): `arc-agi_test_challenges.json`, global budget
   `ARCJEPA_GLOBAL_HOURS` (default 11 h), fair-share seconds per task, shortest task first.
 * Interactive / commit run: dev mode on the 120 public evaluation tasks (`ARCJEPA_DEV_HOURS`, default 1 h,
-  `ARCJEPA_DEV_MAX_TASKS` to cap), scored with the competition metric.
+  `ARCJEPA_DEV_MAX_TASKS` to cap), scored with the competition metric. The last cell is a **gate**: it raises
+  (the commit fails and cannot be submitted) when the code dataset is missing, the trained package is not found
+  or is a debug/smoke package, or no solver process could load it. A competition rerun never fails on these.
 
-Other switches: `ARCJEPA_WORKERS` (default `auto`), `ARCJEPA_PKG` (explicit package folder),
-`ARCJEPA_MAX_TASK_SECONDS` (default 1800).
+Other switches: `ARCJEPA_WORKERS` (default `auto`), `ARCJEPA_THREADS` (torch threads per solver process, default
+auto = CPUs / workers), `ARCJEPA_PKG` (explicit package folder),
+`ARCJEPA_MAX_TASK_SECONDS` (default `auto` = max(1800, 2 x budget x workers / tasks)); local testing only:
+`ARCJEPA_ALLOW_SYMBOLIC=1`, `ARCJEPA_ALLOW_DEBUG_PKG=1` (the gate reports instead of raising).
 """
 
 INFER_SETUP_SRC = r'''
@@ -89,8 +96,11 @@ IS_RERUN = bool(os.environ.get("KAGGLE_IS_COMPETITION_RERUN"))
 GLOBAL_BUDGET_S = float(os.environ.get("ARCJEPA_GLOBAL_HOURS", "11")) * 3600.0
 DEV_HOURS = float(os.environ.get("ARCJEPA_DEV_HOURS", "1.0"))
 DEV_MAX_TASKS = int(os.environ.get("ARCJEPA_DEV_MAX_TASKS", "0") or 0)
-MAX_TASK_SECONDS = float(os.environ.get("ARCJEPA_MAX_TASK_SECONDS", "1800"))
+MAX_TASK_ENV = os.environ.get("ARCJEPA_MAX_TASK_SECONDS", "auto")
+ALLOW_SYMBOLIC = os.environ.get("ARCJEPA_ALLOW_SYMBOLIC", "0") == "1"    # local tests only (Kaggle sets no env)
+ALLOW_DEBUG_PKG = os.environ.get("ARCJEPA_ALLOW_DEBUG_PKG", "0") == "1"  # local tests only
 WORKERS_ENV = os.environ.get("ARCJEPA_WORKERS", "auto")
+THREADS = int(os.environ.get("ARCJEPA_THREADS", "0") or 0) or None  # torch threads per solver process (auto)
 WORK = os.environ.get("ARCJEPA_WORK", "/kaggle/working")
 SUBMISSION = os.path.join(WORK, "submission.json")
 COMP_DIRS = [d for d in (os.environ.get("ARCJEPA_COMP_DIR", ""),
@@ -129,20 +139,83 @@ else:
     print("WARNING: arc-agi_test_challenges.json not found under", COMP_DIRS)
 '''
 
+#: locate the code dataset, copy it to /kaggle/working/arc-jepa (falling back to the read-only mount when the copy
+#: fails: this cell runs after the fallback submission.json exists, so it must never throw) and import it
+INFER_CODE_SRC = r'''
+# ---- locate the ARC-JEPA code dataset, copy it to /kaggle/working/arc-jepa, put it on sys.path
+CODE_CANDIDATES = [os.environ.get("ARCJEPA_CODE", ""), "/kaggle/input/datasets/poby7722/arc-jepa-code",
+                   "/kaggle/input/arc-jepa-code"]
+CODE_DST = os.path.join(WORK, "arc-jepa")
+
+
+def find_code_root(cands):
+    """First folder holding arcjepa/__init__.py: the candidates (up to two levels deep), then /kaggle/input."""
+    for base in [c for c in cands if c and os.path.isdir(c)]:
+        for pat in ("", "*", "*/*"):
+            for d in (sorted(glob.glob(os.path.join(base, pat))) if pat else [base]):
+                if os.path.isfile(os.path.join(d, "arcjepa", "__init__.py")):
+                    return d
+    hits = sorted(glob.glob("/kaggle/input/**/arcjepa/__init__.py", recursive=True))
+    return os.path.dirname(os.path.dirname(hits[0])) if hits else None
+
+
+CODE_SRC = None
+CODE_PATH = None
+CODE_OK = False
+try:
+    CODE_SRC = find_code_root(CODE_CANDIDATES)
+    if CODE_SRC:
+        CODE_PATH = CODE_DST
+        if os.path.abspath(CODE_SRC) != os.path.abspath(CODE_DST):
+            try:
+                shutil.copytree(CODE_SRC, CODE_DST, dirs_exist_ok=True,
+                                ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".pytest_cache", "runs", ".git"))
+            except Exception as exc:  # importing from the read-only mount works too
+                print("copying the code failed (%r); importing it from %s" % (exc, CODE_SRC))
+                CODE_PATH = CODE_SRC
+        if CODE_PATH not in sys.path:
+            sys.path.insert(0, CODE_PATH)
+        os.environ["PYTHONPATH"] = CODE_PATH + os.pathsep + os.environ.get("PYTHONPATH", "")  # spawn workers
+        import arcjepa  # noqa: F401
+
+        CODE_OK = True
+except Exception:
+    traceback.print_exc()
+print("code source:", CODE_SRC, "-> imported from", CODE_PATH, "| import ok:", CODE_OK)
+
+# ---- the episodes dataset (task mirror; dev mode reads tasks/eval_public.jsonl when the competition files lack it)
+EPISODES_ROOT = None
+for base in [os.environ.get("ARCJEPA_DATA", ""), "/kaggle/input/datasets/poby7722/arc-agi-2-jepa-episodes",
+             "/kaggle/input/arc-agi-2-jepa-episodes"]:
+    if not base or not os.path.isdir(base):
+        continue
+    hits = sorted(glob.glob(os.path.join(base, "tasks", "train.jsonl")) + glob.glob(os.path.join(base, "*", "tasks", "train.jsonl")))
+    if hits:
+        EPISODES_ROOT = os.path.dirname(os.path.dirname(hits[0]))
+        break
+if EPISODES_ROOT:
+    os.environ["ARCJEPA_DATA"] = EPISODES_ROOT
+print("episodes dataset:", EPISODES_ROOT)
+'''
+
 INFER_PKG_SRC = r'''
-# ---- model package (kernel output of poby7722/arc-jepa-train); symbolic mode when missing
+# ---- model package (kernel output of poby7722/arc-jepa-train, mounted under /kaggle/input); symbolic mode when
+# missing. Explicit mounts first, then a walk for arc_jepa_pkg folders (config.json + model.safetensors).
 PKG_DIR = None
+PKG_INFO = {}
 RUNNER_OK = False
 if CODE_OK:
     try:
-        from arcjepa.utils.kaggle_submit_runner import RunnerConfig, find_package, run_submission
+        from arcjepa.utils.kaggle_submit_runner import (RunnerConfig, find_package, load_model_package,
+                                                        package_info, run_submission)
 
         RUNNER_OK = True
         PKG_DIR = find_package([os.environ.get("ARCJEPA_PKG", ""),
-                                "/kaggle/input/arc-jepa-train/arc_jepa_pkg",
                                 "/kaggle/input/notebooks/poby7722/arc-jepa-train/arc_jepa_pkg",
+                                "/kaggle/input/arc-jepa-train/arc_jepa_pkg",
                                 "/kaggle/input/kernels/poby7722/arc-jepa-train/arc_jepa_pkg"],
                                search_roots=["/kaggle/input"])
+        PKG_INFO = package_info(PKG_DIR) if PKG_DIR else {}
     except Exception:
         traceback.print_exc()
 try:
@@ -156,9 +229,30 @@ if WORKERS_ENV == "auto":
     N_WORKERS = max(1, min(16, N_CPU - 1))
 else:
     N_WORKERS = max(0, int(WORKERS_ENV))
+if N_WORKERS > 0 and "__file__" in globals():
+    # executed as a plain script (local simulation only): spawn workers would re-run this unguarded script.
+    # Kaggle runs the notebook in a Jupyter kernel (no __file__), where the worker pool is used.
+    print("script mode: solving in-process instead of %d spawn workers" % N_WORKERS)
+    N_WORKERS = 0
 DEVICES = ["cuda:%d" % (i % N_GPU) for i in range(max(1, N_WORKERS))] if (N_GPU and PKG_DIR) else None
+
+
+def task_cap_seconds(budget_s, n_tasks):
+    """Per-task budget cap: ARCJEPA_MAX_TASK_SECONDS, or auto = max(1800, 2 x budget x workers / tasks) so the
+    cap never leaves the global budget idle when there are many workers."""
+    if MAX_TASK_ENV != "auto":
+        return float(MAX_TASK_ENV)
+    return max(1800.0, 2.0 * budget_s * max(1, N_WORKERS) / max(1, n_tasks))
+
+
 print("code:", CODE_OK, "| runner:", RUNNER_OK, "| package:", PKG_DIR or "none (symbolic mode)",
       "| GPUs", N_GPU, "| CPUs", N_CPU, "| workers", N_WORKERS)
+if PKG_DIR:
+    _c = PKG_INFO.get("created_unix")
+    print("package created", time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(_c)) if _c else "?",
+          "| parameters", PKG_INFO.get("n_parameters"), "| training config", PKG_INFO.get("config_path"))
+    if PKG_INFO.get("debug"):
+        print("WARNING: this is a DEBUG (smoke) package: the training kernel did not run the full config")
 '''
 
 INFER_RERUN_SRC = r'''
@@ -167,12 +261,14 @@ RERUN_SUMMARY = None
 if IS_RERUN and RUNNER_OK and test_challenges:
     try:
         cfg = RunnerConfig(total_seconds=GLOBAL_BUDGET_S, reserve_seconds=RESERVE_S, min_task_seconds=2.0,
-                           max_task_seconds=MAX_TASK_SECONDS, rewrite_every_s=60.0, workers=N_WORKERS,
-                           devices=DEVICES)
+                           max_task_seconds=task_cap_seconds(GLOBAL_BUDGET_S, len(test_challenges)),
+                           rewrite_every_s=60.0, workers=N_WORKERS, devices=DEVICES, threads_per_worker=THREADS)
         RERUN_SUMMARY = run_submission(test_challenges, SUBMISSION, pkg_dir=PKG_DIR, cfg=cfg,
                                        initial=load_json(SUBMISSION), start_time=T0,
                                        diagnostics_path=os.path.join(WORK, "rerun_diagnostics.json"))
         print({k: v for k, v in RERUN_SUMMARY.items() if k not in ("diagnostics", "unstarted")})
+        if PKG_DIR and not RERUN_SUMMARY.get("model_loaded"):
+            print("WARNING: package %s was found but no worker loaded it: symbolic search only" % PKG_DIR)
     except Exception:
         traceback.print_exc()
 elif IS_RERUN:
@@ -182,6 +278,7 @@ elif IS_RERUN:
 INFER_DEV_SRC = r'''
 # ---- dev mode: the 120 public evaluation tasks, scored with the competition metric
 DEV_RESULT = None
+DEV_SUMMARY = None
 if not IS_RERUN:
     eval_ch, eval_sol = {}, {}
     ch_path = find_comp_file("arc-agi_evaluation_challenges.json")
@@ -204,10 +301,14 @@ if not IS_RERUN:
         try:
             cfg = RunnerConfig(total_seconds=DEV_HOURS * 3600.0, reserve_seconds=min(30.0, 0.05 * DEV_HOURS * 3600.0),
                                min_task_seconds=2.0,
-                               max_task_seconds=MAX_TASK_SECONDS, rewrite_every_s=60.0, workers=N_WORKERS,
-                               devices=DEVICES)
+                               max_task_seconds=task_cap_seconds(DEV_HOURS * 3600.0, len(eval_ch)),
+                               rewrite_every_s=60.0, workers=N_WORKERS, devices=DEVICES, threads_per_worker=THREADS)
             dev_summary = run_submission(eval_ch, dev_sub_path, pkg_dir=PKG_DIR, cfg=cfg, start_time=time.time(),
                                          diagnostics_path=os.path.join(WORK, "dev_run_diagnostics.json"))
+            DEV_SUMMARY = {k: v for k, v in dev_summary.items() if k != "diagnostics"}
+            print("dev run: model loaded by %s of the workers | pool restarts %d | quarantined %s" % (
+                dev_summary.get("model_loaded_fraction"), dev_summary.get("pool_restarts", 0),
+                dev_summary.get("quarantined")))
             dev_sub = load_json(dev_sub_path)
             from arcjepa.core.types import task_from_json
             from arcjepa.eval.evaluate import competition_score, evaluate, replay_solver
@@ -252,6 +353,43 @@ else:
     print("no test challenges found; nothing to validate")
 '''
 
+INFER_GATE_SRC = r'''
+# ---- dev / commit gate: a broken setup fails this run loudly, so the version cannot be submitted.
+# Never active in a competition rerun (there the fallback / symbolic submission above stands).
+GATE_PROBLEMS = []
+if not IS_RERUN:
+    if not CODE_OK:
+        GATE_PROBLEMS.append("the arcjepa code dataset was not found or does not import (looked in %s)"
+                             % [c for c in CODE_CANDIDATES if c])
+    elif not RUNNER_OK:
+        GATE_PROBLEMS.append("arcjepa.utils.kaggle_submit_runner does not import")
+    if RUNNER_OK and not PKG_DIR:
+        GATE_PROBLEMS.append("no trained package (arc_jepa_pkg: config.json + model.safetensors) under /kaggle/input;"
+                             " is the poby7722/arc-jepa-train output attached and complete?")
+    if PKG_DIR and PKG_INFO.get("debug") and not ALLOW_DEBUG_PKG:
+        GATE_PROBLEMS.append("the package %s was trained with the debug config (%s parameters): the training kernel"
+                             " ran in smoke mode" % (PKG_DIR, PKG_INFO.get("n_parameters")))
+    if PKG_DIR and RUNNER_OK:
+        frac = DEV_SUMMARY.get("model_loaded_fraction") if DEV_SUMMARY else None
+        loaded = None if frac is None else frac > 0
+        if loaded is None:  # no dev run / no task finished: try one load here
+            try:
+                loaded = load_model_package(PKG_DIR, "cpu") is not None
+            except Exception:
+                traceback.print_exc()
+                loaded = False
+        if not loaded:
+            GATE_PROBLEMS.append("no solver process could load the package %s (see the warnings above)" % PKG_DIR)
+    if GATE_PROBLEMS:
+        GATE_MSG = "DEV GATE FAILED (this version must not be submitted):\n - " + "\n - ".join(GATE_PROBLEMS)
+        if ALLOW_SYMBOLIC:
+            print(GATE_MSG + "\n(ARCJEPA_ALLOW_SYMBOLIC=1: reported, not raised)")
+        else:
+            raise RuntimeError(GATE_MSG)
+    else:
+        print("dev gate passed: code OK, package %s (%s parameters) loaded" % (PKG_DIR, PKG_INFO.get("n_parameters")))
+'''
+
 
 def build_infer_notebook() -> Dict[str, Any]:
     """The inference notebook as nbformat JSON."""
@@ -260,11 +398,12 @@ def build_infer_notebook() -> Dict[str, Any]:
         code_cell("infer-01-setup", INFER_SETUP_SRC),
         code_cell("infer-02-validator", inline_validator_source()),
         code_cell("infer-03-fallback", INFER_LOAD_SRC),
-        code_cell("infer-04-code", CODE_SETUP_SRC),
+        code_cell("infer-04-code", INFER_CODE_SRC),
         code_cell("infer-05-package", INFER_PKG_SRC),
         code_cell("infer-06-rerun", INFER_RERUN_SRC),
         code_cell("infer-07-dev", INFER_DEV_SRC),
         code_cell("infer-08-validate", INFER_VALIDATE_SRC),
+        code_cell("infer-09-dev-gate", INFER_GATE_SRC),
     ])
 
 

@@ -1,0 +1,417 @@
+{
+ "harness": "arcjepa.eval.hard180",
+ "harness_version": 1,
+ "tag": "symbolic_v2dsl",
+ "created": "2026-09-27T13:28:19",
+ "split_file": "data/splits_670_150_180.json",
+ "hard180_sha256": "109f247cbc0ccf729e1a66d0747bcb2fde5e68c3715a90f76a271e94d447f9db",
+ "model": null,
+ "model_loaded": false,
+ "budget_s": 60.0,
+ "workers": 6,
+ "threads_per_worker": 1,
+ "solver_overrides": {},
+ "max_tasks": null,
+ "per_task_file": "symbolic_v2dsl_h180_per_task.jsonl",
+ "wall_s_this_invocation": 1445.6,
+ "solve_config": {
+  "beam_width": 64,
+  "max_depth": 6,
+  "top_primitives": 8,
+  "astar_max_nodes": 50000,
+  "alpha": 1.0,
+  "beta": 10.0,
+  "gamma": 0.15,
+  "tta_enabled": true,
+  "tta_steps": 8,
+  "tta_lr": 0.05,
+  "tta_anchor": 0.1,
+  "repair_enabled": true,
+  "repair_max_rounds": 4,
+  "memory_top_k": 16,
+  "num_candidates": 2,
+  "evo_pop": 32,
+  "evo_gens": 20,
+  "evo_p_mut": 0.4,
+  "evo_p_cross": 0.2,
+  "evo_p_neural": 0.4,
+  "per_task_seconds": 60.0,
+  "bucket_beam_width": [
+   32,
+   64,
+   128,
+   128
+  ],
+  "bucket_repair_rounds": [
+   1,
+   2,
+   4,
+   4
+  ],
+  "difficulty_thresholds": [
+   0.38,
+   0.47,
+   0.59
+  ],
+  "escalate": true,
+  "induce": true,
+  "use_neural_prior": true,
+  "seed": 0
+ },
+ "split": "hard180",
+ "n_tasks": 180,
+ "n_done": 180,
+ "complete": true,
+ "incomplete": [],
+ "headline": {
+  "metric": "task-level pass@2 (every test output solved by attempt 1 or 2)",
+  "task_pass": 24,
+  "n": 180,
+  "rate": 0.133333,
+  "text": "24/180 = 13.3%"
+ },
+ "task_pass@2": {
+  "count": 24,
+  "n": 180,
+  "rate": 0.133333
+ },
+ "output_pass@2": {
+  "count": 27,
+  "total": 199,
+  "rate": 0.135678
+ },
+ "exact_program": {
+  "count": 26,
+  "n": 180,
+  "rate": 0.144444
+ },
+ "near_90_cell": {
+  "count": 54,
+  "n": 180,
+  "rate": 0.3,
+  "definition": "every test output has an attempt with <= 10% wrong cells (solved included)"
+ },
+ "runtime_s": {
+  "n": 180,
+  "mean": 47.0024,
+  "median": 52.8685,
+  "p90": 57.4057,
+  "max": 58.215,
+  "sum": 8460.427
+ },
+ "failure_categories": {
+  "solved": 24,
+  "wrong_shape": 30,
+  "exact_fit_wrong_on_test": 3,
+  "near_miss_90": 30,
+  "no_candidate_close": 93
+ },
+ "per_family": {
+  "composition": {
+   "n": 17,
+   "n_done": 17,
+   "task_pass": 2,
+   "task_pass_rate": 0.117647,
+   "output_pass": 2,
+   "output_total": 21,
+   "exact_program": 2,
+   "exact_program_rate": 0.117647,
+   "near_90": 7,
+   "near_90_rate": 0.411765
+  },
+  "context": {
+   "n": 55,
+   "n_done": 55,
+   "task_pass": 5,
+   "task_pass_rate": 0.090909,
+   "output_pass": 6,
+   "output_total": 61,
+   "exact_program": 6,
+   "exact_program_rate": 0.109091,
+   "near_90": 13,
+   "near_90_rate": 0.236364
+  },
+  "counting": {
+   "n": 8,
+   "n_done": 8,
+   "task_pass": 0,
+   "task_pass_rate": 0.0,
+   "output_pass": 0,
+   "output_total": 8,
+   "exact_program": 0,
+   "exact_program_rate": 0.0,
+   "near_90": 0,
+   "near_90_rate": 0.0
+  },
+  "geometry": {
+   "n": 1,
+   "n_done": 1,
+   "task_pass": 1,
+   "task_pass_rate": 1.0,
+   "output_pass": 1,
+   "output_total": 1,
+   "exact_program": 1,
+   "exact_program_rate": 1.0,
+   "near_90": 1,
+   "near_90_rate": 1.0
+  },
+  "object": {
+   "n": 66,
+   "n_done": 66,
+   "task_pass": 7,
+   "task_pass_rate": 0.106061,
+   "output_pass": 8,
+   "output_total": 74,
+   "exact_program": 7,
+   "exact_program_rate": 0.106061,
+   "near_90": 19,
+   "near_90_rate": 0.287879
+  },
+  "pattern": {
+   "n": 12,
+   "n_done": 12,
+   "task_pass": 6,
+   "task_pass_rate": 0.5,
+   "output_pass": 6,
+   "output_total": 12,
+   "exact_program": 6,
+   "exact_program_rate": 0.5,
+   "near_90": 7,
+   "near_90_rate": 0.583333
+  },
+  "relation": {
+   "n": 16,
+   "n_done": 16,
+   "task_pass": 2,
+   "task_pass_rate": 0.125,
+   "output_pass": 2,
+   "output_total": 16,
+   "exact_program": 2,
+   "exact_program_rate": 0.125,
+   "near_90": 6,
+   "near_90_rate": 0.375
+  },
+  "symmetry": {
+   "n": 5,
+   "n_done": 5,
+   "task_pass": 1,
+   "task_pass_rate": 0.2,
+   "output_pass": 2,
+   "output_total": 6,
+   "exact_program": 2,
+   "exact_program_rate": 0.4,
+   "near_90": 1,
+   "near_90_rate": 0.2
+  }
+ },
+ "per_bucket": {
+  "0": {
+   "n": 44,
+   "n_done": 44,
+   "task_pass": 8,
+   "task_pass_rate": 0.181818,
+   "output_pass": 9,
+   "output_total": 47,
+   "exact_program": 7,
+   "exact_program_rate": 0.159091,
+   "near_90": 17,
+   "near_90_rate": 0.386364
+  },
+  "1": {
+   "n": 42,
+   "n_done": 42,
+   "task_pass": 6,
+   "task_pass_rate": 0.142857,
+   "output_pass": 6,
+   "output_total": 44,
+   "exact_program": 6,
+   "exact_program_rate": 0.142857,
+   "near_90": 16,
+   "near_90_rate": 0.380952
+  },
+  "2": {
+   "n": 44,
+   "n_done": 44,
+   "task_pass": 3,
+   "task_pass_rate": 0.068182,
+   "output_pass": 5,
+   "output_total": 54,
+   "exact_program": 4,
+   "exact_program_rate": 0.090909,
+   "near_90": 11,
+   "near_90_rate": 0.25
+  },
+  "3": {
+   "n": 50,
+   "n_done": 50,
+   "task_pass": 7,
+   "task_pass_rate": 0.14,
+   "output_pass": 7,
+   "output_total": 54,
+   "exact_program": 9,
+   "exact_program_rate": 0.18,
+   "near_90": 10,
+   "near_90_rate": 0.2
+  }
+ },
+ "search": {
+  "search_nodes": {
+   "n": 180,
+   "mean": 48605.7333,
+   "median": 30808.0,
+   "p90": 111329.1,
+   "max": 301034.0,
+   "sum": 8749032.0
+  },
+  "beam_expansions": {
+   "n": 180,
+   "mean": 40171.9111,
+   "median": 25463.0,
+   "p90": 89570.6,
+   "max": 255024.0,
+   "sum": 7230944.0
+  },
+  "astar_nodes": {
+   "n": 164,
+   "mean": 8924.3415,
+   "median": 5282.0,
+   "p90": 21192.9,
+   "max": 50005.0,
+   "sum": 1463592.0
+  },
+  "evo_generations": {
+   "n": 160,
+   "mean": 10.6438,
+   "median": 9.5,
+   "p90": 20.0,
+   "max": 20.0,
+   "sum": 1703.0
+  },
+  "repair_rounds": {
+   "n": 180,
+   "mean": 1.3944,
+   "median": 1.0,
+   "p90": 2.0,
+   "max": 4.0,
+   "sum": 251.0
+  },
+  "tta_steps": {
+   "n": 180,
+   "mean": 0.0,
+   "median": 0.0,
+   "p90": 0.0,
+   "max": 0.0,
+   "sum": 0.0
+  },
+  "candidate_count": {
+   "n": 180,
+   "mean": 174.8778,
+   "median": 180.5,
+   "p90": 240.7,
+   "max": 371.0,
+   "sum": 31478.0
+  }
+ },
+ "n_errors": 0,
+ "n_overrun": 0,
+ "missing_counters": [],
+ "task_pass_ids": [
+  "00576224",
+  "00dbd492",
+  "1f85a75f",
+  "22eb0ac0",
+  "239be575",
+  "253bf280",
+  "281123b4",
+  "484b58aa",
+  "48d8fb45",
+  "543a7ed5",
+  "59341089",
+  "66e6c45b",
+  "68b16354",
+  "6d0aefbc",
+  "7b7f7511",
+  "a1570a43",
+  "a416b8f3",
+  "ac0a08a4",
+  "ae58858e",
+  "b1948b0a",
+  "c0f76784",
+  "d037b0a7",
+  "d511f180",
+  "fafffa47"
+ ],
+ "exact_fit_wrong_on_test_ids": [
+  "4cd1b7b2",
+  "642d658d",
+  "73ccf9c2"
+ ],
+ "near_miss_90_ids": [
+  "0e206a2e",
+  "11e1fe23",
+  "22208ba4",
+  "2546ccf6",
+  "3490cc26",
+  "4093f84a",
+  "50c07299",
+  "53b68214",
+  "5b692c0f",
+  "623ea044",
+  "696d4842",
+  "6d58a25d",
+  "73c3b0d8",
+  "776ffc46",
+  "7d1f7ee8",
+  "7e576d6e",
+  "890034e9",
+  "92e50de0",
+  "97999447",
+  "9f5f939b",
+  "a5f85a15",
+  "b2862040",
+  "b775ac94",
+  "b7955b3c",
+  "d13f3404",
+  "d2abd087",
+  "e1d2900e",
+  "e4888269",
+  "e5c44e8f",
+  "fd096ab6"
+ ],
+ "subsets": {
+  "hard180_clean150": {
+   "n": 150,
+   "n_done": 150,
+   "task_pass": 22,
+   "task_pass_rate": 0.146667,
+   "output_pass": 25,
+   "output_total": 160,
+   "exact_program": 24,
+   "exact_program_rate": 0.16,
+   "near_90": 47,
+   "near_90_rate": 0.313333
+  },
+  "hard180_from_old_train": {
+   "n": 30,
+   "n_done": 30,
+   "task_pass": 2,
+   "task_pass_rate": 0.066667,
+   "output_pass": 2,
+   "output_total": 39,
+   "exact_program": 2,
+   "exact_program_rate": 0.066667,
+   "near_90": 7,
+   "near_90_rate": 0.233333
+  }
+ },
+ "target": {
+  "task_pass": 100,
+  "n": 180,
+  "met": false,
+  "gap": 76
+ },
+ "notes": [
+  "search_nodes = solver 'search_nodes' when reported, else beam_expansions + astar_nodes + evo_generations x evo_pop (read-only from the diagnostics)",
+  "exact_program_found = a search candidate fits every demo exactly (n_exact > 0) or the induced property table fired"
+ ]
+}

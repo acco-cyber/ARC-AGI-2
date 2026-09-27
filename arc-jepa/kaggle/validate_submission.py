@@ -116,22 +116,56 @@ def validate_file(path: str, challenges_path: Optional[str] = None) -> List[str]
     return validate_submission(sub, challenges)
 
 
+def predicted_output_shape(demo: Sequence[Any], test_input: Any) -> Optional[Any]:
+    """Output shape implied by valid demo (input, output) grids: same as input, a consistent integer scaling or a
+    constant shape; else None (same rule as arcjepa.search.diversity.predict_output_shape)."""
+    if not demo or grid_error(test_input) is not None:
+        return None
+    ih, iw = len(test_input), len(test_input[0])
+    shapes = [((len(i), len(i[0])), (len(o), len(o[0]))) for i, o in demo]
+    if all(a == b for a, b in shapes):
+        return (ih, iw)
+    fr = {(o[0] / i[0], o[1] / i[1]) for i, o in shapes}
+    if len(fr) == 1:
+        a, b = next(iter(fr))
+        h, w = ih * a, iw * b
+        if abs(h - round(h)) < 1e-9 and abs(w - round(w)) < 1e-9 and 1 <= round(h) <= 30 and 1 <= round(w) <= 30:
+            return (int(round(h)), int(round(w)))
+    outs = {o for _, o in shapes}
+    return next(iter(outs)) if len(outs) == 1 else None
+
+
 def fallback_attempts(task: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Always-valid attempts for every test input of a challenges task dict: attempt_1 = the test input
-    (identity), attempt_2 = the most common demo output shape filled with the most common demo output colour."""
-    demo_outs = [p.get("output") for p in task.get("train", []) if isinstance(p, dict)]
-    demo_outs = [o for o in demo_outs if grid_error(o) is None]
-    if demo_outs:
-        shape = Counter((len(o), len(o[0])) for o in demo_outs).most_common(1)[0][0]
-        colour = Counter(v for o in demo_outs for row in o for v in row).most_common(1)[0][0]
-    else:
-        shape, colour = (1, 1), 0
-    fill = [[int(colour)] * shape[1] for _ in range(shape[0])]
+    """Always-valid attempts for every test input of a challenges task dict, without any search: the first two
+    distinct grids of [constant demo output (all demo outputs equal); the identity for identity tasks (every demo
+    output equals its input); the predicted output shape (else the most common demo output shape) filled with the
+    most common and the second most common demo output colour; the identity; [[0]]]. The identity is a last
+    resort: no test output of the 1,000 public training tasks equals its input. Same rule as
+    arcjepa.utils.kaggle_submit_runner.fallback_attempts."""
+    demo = [(p["input"], p["output"]) for p in task.get("train", []) or []
+            if isinstance(p, dict) and grid_error(p.get("input")) is None and grid_error(p.get("output")) is None]
+    outs = [o for _, o in demo]
+    ident_ok = bool(demo) and all(i == o for i, o in demo)
+    colours = [c for c, _ in Counter(v for o in outs for row in o for v in row).most_common(2)]
+    common = Counter((len(o), len(o[0])) for o in outs).most_common(1)[0][0] if outs else None
     out: List[Dict[str, Any]] = []
     for tp in task.get("test", []) or [{}]:
         g = tp.get("input") if isinstance(tp, dict) else None
-        ident = [list(r) for r in g] if grid_error(g) is None else [[0]]
-        out.append({"attempt_1": ident, "attempt_2": [list(r) for r in fill]})
+        valid_in = grid_error(g) is None
+        opts: List[Any] = []
+        if outs and all(o == outs[0] for o in outs):
+            opts.append(outs[0])
+        if valid_in and ident_ok:
+            opts.append(g)
+        if outs:
+            shape = (predicted_output_shape(demo, g) if valid_in else None) or common
+            opts.extend([[int(c)] * shape[1] for _ in range(shape[0])] for c in colours)
+        if valid_in:
+            opts.append(g)
+        opts.append([[0]])
+        a1 = opts[0]
+        a2 = next((o for o in opts[1:] if o != a1), a1)
+        out.append({"attempt_1": [list(r) for r in a1], "attempt_2": [list(r) for r in a2]})
     return out
 
 

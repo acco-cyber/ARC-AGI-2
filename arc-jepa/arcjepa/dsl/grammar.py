@@ -11,7 +11,7 @@ import functools
 import itertools
 import logging
 import random
-from typing import Any, Dict, FrozenSet, Iterator, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, FrozenSet, Iterator, List, Mapping, Optional, Sequence, Set, Tuple
 
 from arcjepa.core.types import Grid
 from arcjepa.dsl.ast import INPUT, OBJ, Node
@@ -120,12 +120,21 @@ def random_literal(rng: random.Random, t: T, domain: Optional[Sequence[Any]] = N
     return rng.choice(list(domain))
 
 
-def _pick_primitive(rng: random.Random, cands: List[Primitive], prefs: Optional[Set[str]]) -> Primitive:
+def _choice(rng: random.Random, cands: List[Primitive], weights: Optional[Mapping[str, float]]) -> Primitive:
+    """Uniform choice (``weights`` None: the exact historical RNG stream), else weighted by ``weights[name]``
+    (default 1.0 for names not in the table)."""
+    if not weights:
+        return rng.choice(cands)
+    return rng.choices(cands, weights=[max(0.0, float(weights.get(p.name, 1.0))) + 1e-12 for p in cands])[0]
+
+
+def _pick_primitive(rng: random.Random, cands: List[Primitive], prefs: Optional[Set[str]],
+                    weights: Optional[Mapping[str, float]] = None) -> Primitive:
     if prefs:
         preferred = [p for p in cands if p.category in prefs]
         if preferred and rng.random() < 0.75:
-            return rng.choice(preferred)
-    return rng.choice(cands)
+            return _choice(rng, preferred, weights)
+    return _choice(rng, cands, weights)
 
 
 def _choose_child_depth(rng: random.Random, t: T, max_d: int, in_lambda: bool) -> Optional[int]:
@@ -140,10 +149,21 @@ def _choose_child_depth(rng: random.Random, t: T, max_d: int, in_lambda: bool) -
     return rng.choices(opts, weights=weights)[0]
 
 
+_CANDIDATES_MEMO: Dict[Tuple[T, int, bool, int], List[Primitive]] = {}
+
+
 def _candidates(target: T, depth: int, in_lambda: bool) -> List[Primitive]:
-    """Primitives that can head an expression of ``target`` with exactly ``depth`` levels."""
-    return [p for p in expansions(target, depth, in_lambda=in_lambda)
-            if any(_arg_reachable(u, in_lambda, depth - 1) for u in p.arg_types)]
+    """Primitives that can head an expression of ``target`` with exactly ``depth`` levels (registry order).
+
+    Memoised (a pure function of its arguments and the registry, like :func:`reachable`; keyed on the registry
+    size too): recomputing it was ~15 % of the synthetic generator's time.  Callers must not mutate the list."""
+    key = (target, depth, in_lambda, len(REGISTRY))
+    got = _CANDIDATES_MEMO.get(key)
+    if got is None:
+        got = [p for p in expansions(target, depth, in_lambda=in_lambda)
+               if any(_arg_reachable(u, in_lambda, depth - 1) for u in p.arg_types)]
+        _CANDIDATES_MEMO[key] = got
+    return got
 
 
 @functools.lru_cache(maxsize=None)
@@ -170,12 +190,13 @@ def _host_args(p: Primitive, depth: int, in_lambda: bool, prefs: FrozenSet[str])
 
 def random_expression(rng: random.Random, target: T, depth: int, *, in_lambda: bool = False,
                       prefs: Optional[Set[str]] = None, domain: Optional[Sequence[Any]] = None,
-                      host: bool = False) -> Any:
+                      host: bool = False, weights: Optional[Mapping[str, float]] = None) -> Any:
     """Random expression of type ``target`` with exactly ``depth`` levels (Node, or a literal at depth 0).
 
     ``prefs`` biases primitive choice towards those categories; with ``host=True`` the expression is additionally
-    forced to contain at least one preferred primitive whenever that is feasible at this depth.  Returns ``None``
-    when no expression exists.
+    forced to contain at least one preferred primitive whenever that is feasible at this depth.  ``weights``
+    (primitive name -> relative weight, default 1.0) re-weights every primitive choice; ``None`` keeps the uniform
+    choice.  Returns ``None`` when no expression exists.
     """
     if depth == 0:
         if target is T.GRID:
@@ -196,7 +217,7 @@ def random_expression(rng: random.Random, target: T, depth: int, *, in_lambda: b
         else:
             host = False
     for _ in range(4):
-        p = _pick_primitive(rng, cands, prefs)
+        p = _pick_primitive(rng, cands, prefs, weights)
         need_host = host and p.category not in fprefs
         if need_host:
             deep = _host_args(p, depth, in_lambda, fprefs)
@@ -213,10 +234,10 @@ def random_expression(rng: random.Random, target: T, depth: int, *, in_lambda: b
                 break
             h_i = need_host and i == j
             if u is T.PROGRAM:
-                val = _random_body(rng, d_i, prefs, host=h_i)
+                val = _random_body(rng, d_i, prefs, host=h_i, weights=weights)
             else:
                 val = random_expression(rng, gt, d_i, in_lambda=lam, prefs=prefs, domain=p.literal_args.get(i),
-                                        host=h_i)
+                                        host=h_i, weights=weights)
             if val is None:
                 ok = False
                 break
@@ -226,7 +247,8 @@ def random_expression(rng: random.Random, target: T, depth: int, *, in_lambda: b
     return None
 
 
-def _random_body(rng: random.Random, depth: int, prefs: Optional[Set[str]], host: bool = False) -> Optional[Node]:
+def _random_body(rng: random.Random, depth: int, prefs: Optional[Set[str]], host: bool = False,
+                 weights: Optional[Mapping[str, float]] = None) -> Optional[Node]:
     """Random PROGRAM argument (OBJECT -> OBJECT lambda body over ``OBJ``) with exactly ``depth`` levels.
 
     With probability 0.15 (depth >= 2, no hosting constraint) the body is a ``COMPOSE`` of two smaller bodies, so
@@ -234,13 +256,13 @@ def _random_body(rng: random.Random, depth: int, prefs: Optional[Set[str]], host
     times.
     """
     if depth >= 2 and not host and rng.random() < 0.15:
-        first = _random_body(rng, depth - 1, prefs)
-        second = _random_body(rng, rng.randint(1, depth - 1), prefs)
+        first = _random_body(rng, depth - 1, prefs, weights=weights)
+        second = _random_body(rng, rng.randint(1, depth - 1), prefs, weights=weights)
         if first is not None and second is not None:
             return Node("COMPOSE", (first, second))
     val: Any = None
     for _ in range(4):
-        val = random_expression(rng, T.OBJECT, depth, in_lambda=True, prefs=prefs, host=host)
+        val = random_expression(rng, T.OBJECT, depth, in_lambda=True, prefs=prefs, host=host, weights=weights)
         if isinstance(val, Node) and val.uses_obj():
             return val
     return val if isinstance(val, Node) else None
@@ -277,14 +299,15 @@ def _executes(node: Node) -> bool:
     return False
 
 
-def random_program(rng: random.Random, depth: Optional[int] = None, category: Optional[str] = None) -> Node:
+def random_program(rng: random.Random, depth: Optional[int] = None, category: Optional[str] = None, *,
+                   weights: Optional[Mapping[str, float]] = None) -> Node:
     """Sample a GRID-typed program with exactly ``depth`` levels, biased towards ``category``.
 
     ``depth=None`` draws the depth from the spec mix :data:`DEPTH_MIX`.  ``category`` is a spec sample category
     (object, geometry, relational, counting, contextual, adversarial) or a primitive category name; when a program
-    of that depth can contain a primitive of the category, the sample is forced to contain one.  Up to 16
-    candidates are drawn; the first that type-checks and executes on a probe grid is returned, else the first
-    well-typed candidate.
+    of that depth can contain a primitive of the category, the sample is forced to contain one.  ``weights``
+    re-weights primitive choices (see :func:`random_expression`).  Up to 16 candidates are drawn; the first that
+    type-checks and executes on a probe grid is returned, else the first well-typed candidate.
     """
     if depth is None:
         depth = sample_depth(rng)
@@ -297,7 +320,7 @@ def random_program(rng: random.Random, depth: Optional[int] = None, category: Op
         feasible = can_host(T.GRID, depth, False, frozenset(prefs))
     fallback: Optional[Node] = None
     for _ in range(16):
-        node = random_expression(rng, T.GRID, depth, prefs=prefs, host=feasible)
+        node = random_expression(rng, T.GRID, depth, prefs=prefs, host=feasible, weights=weights)
         if node is None or not isinstance(node, Node):
             continue
         try:
@@ -312,7 +335,7 @@ def random_program(rng: random.Random, depth: Optional[int] = None, category: Op
         fallback = fallback or node
     if fallback is not None:
         return fallback
-    node = random_expression(rng, T.GRID, depth)
+    node = random_expression(rng, T.GRID, depth, weights=weights)
     return node if isinstance(node, Node) else Node("ROTATE90", (INPUT,))
 
 

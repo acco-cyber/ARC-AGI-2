@@ -16,7 +16,8 @@ from arcjepa.dsl.interpreter import infer_types, typecheck
 from arcjepa.dsl.primitives import REGISTRY, Primitive, same_signature
 from arcjepa.dsl.types import LITERAL_TYPES, T
 
-__all__ = ["mutate", "hard_negatives", "hard_negatives_typed", "crossover", "HARD_NEGATIVE_TYPES"]
+__all__ = ["mutate", "hard_negatives", "hard_negatives_typed", "crossover", "HARD_NEGATIVE_TYPES",
+           "MUTATION_KINDS"]
 
 log = logging.getLogger(__name__)
 
@@ -83,15 +84,36 @@ def _change_literal(rng: random.Random, node: Node, slot: Tuple[Path, int, T, Pr
     return node.replace(path + (i,), rng.choice(options))
 
 
+def _fit_literals(q: Primitive, args: Tuple[object, ...]) -> Optional[Tuple[object, ...]]:
+    """``args`` with every literal moved into ``q``'s literal domains: an out-of-domain integer becomes the nearest
+    allowed integer (e.g. ``REPEAT_X(g, 1) -> UPSCALE(g, 2)``, whose factors are 2..5); ``None`` when another
+    literal does not fit (the swap would not type-check)."""
+    out = list(args)
+    for i, a in enumerate(args):
+        if isinstance(a, Node):
+            continue
+        dom = q.literal_args.get(i)
+        if dom is None or any(type(v) is type(a) and v == a for v in dom):
+            continue
+        ints = [v for v in dom if isinstance(v, int) and not isinstance(v, bool)]
+        if isinstance(a, int) and not isinstance(a, bool) and ints:
+            out[i] = min(ints, key=lambda v: (abs(v - a), v))
+            continue
+        return None
+    return tuple(out)
+
+
 def _swap_op(rng: random.Random, node: Node, path: Path,
              pred: Optional[Callable[[Primitive], bool]] = None) -> Optional[Node]:
     n = node.get(path)
     if not isinstance(n, Node) or n.op not in REGISTRY:
         return None
-    alts = [q for q in same_signature(REGISTRY[n.op]) if pred is None or pred(q)]
+    alts = [(q, fitted) for q in same_signature(REGISTRY[n.op]) if pred is None or pred(q)
+            for fitted in [_fit_literals(q, n.args)] if fitted is not None]
     if not alts:
         return None
-    return node.replace(path, Node(rng.choice(alts).name, n.args))
+    q, fitted = rng.choice(alts)
+    return node.replace(path, Node(q.name, fitted))
 
 
 def _wrapper_candidates(t: T, category: Optional[str] = None) -> List[Primitive]:
@@ -305,9 +327,16 @@ _HN: Dict[str, Callable[[random.Random, Node, TypeTable], Optional[Node]]] = {
 
 # ======================================================================================= public API
 
-def mutate(rng: random.Random, node: Node) -> Node:
+#: Edit kinds of :func:`mutate`, in its internal order.
+MUTATION_KINDS: Tuple[str, ...] = ("literal", "swap_op", "subtree", "insert_wrapper", "remove_wrapper", "order")
+
+
+def mutate(rng: random.Random, node: Node, kind: Optional[str] = None) -> Node:
     """One random type-preserving edit (literal change, op swap, subtree replacement, wrapper insert/remove,
-    argument reordering).  Returns ``node`` unchanged only when no valid edit was found."""
+    argument reordering).  Returns ``node`` unchanged only when no valid edit was found.
+
+    ``kind`` (one of :data:`MUTATION_KINDS`) tries that edit kind first and falls back to the others in random
+    order; ``None`` draws the order at random (every kind equally likely first)."""
     types = _types(node)
     root_t = _out_type(node)
     if types is None or root_t is None:
@@ -320,7 +349,12 @@ def mutate(rng: random.Random, node: Node) -> Node:
         lambda: _remove_wrapper(rng, node, types),
         lambda: _swap_order(rng, node, types),
     ]
-    rng.shuffle(ops)
+    if kind is None:
+        rng.shuffle(ops)
+    else:
+        first = ops.pop(MUTATION_KINDS.index(kind))
+        rng.shuffle(ops)
+        ops.insert(0, first)
     for op in ops:
         for _ in range(3):
             new = op()

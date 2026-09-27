@@ -5,20 +5,30 @@ error and ``cells`` counts mismatched cells over all pairs (a failed execution o
 cell of the expected output).  ``is_exact`` stops at the first mismatching pair.  Every execution goes through the
 real interpreter (:func:`arcjepa.dsl.interpreter.execute`) with a short per-call timeout, so a verified program is
 exactly what the submission will run.
+
+**Search deadline.** Inside ``with search_deadline(t):`` (``t`` in ``time.perf_counter()`` seconds; the solver
+opens one per task) every interpreter call made through :func:`execute_safe` / :func:`clipped_timeout` has its
+timeout clipped to ``t`` (with a small floor, :data:`MIN_TIMEOUT_S`), so no single execution can run far past the
+task's budget.  The deadline lives in a :class:`contextvars.ContextVar` (context-local, not shared between threads
+or tasks); outside such a block nothing is clipped.
 """
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import logging
+import time
 from collections import Counter
 from itertools import chain
-from typing import List, Optional, Sequence, Tuple
+from typing import Iterator, List, Optional, Sequence, Tuple
 
 from arcjepa.core.types import Grid, Pair, validate_grid
 from arcjepa.dsl.ast import Node
 from arcjepa.dsl.interpreter import execute
 from arcjepa.dsl.primitives import ExecError
 
-__all__ = ["DEFAULT_TIMEOUT_S", "execute_safe", "demo_outputs", "pair_cell_error", "outputs_error", "demo_error",
+__all__ = ["DEFAULT_TIMEOUT_S", "MIN_TIMEOUT_S", "search_deadline", "clipped_timeout", "past_search_deadline",
+           "execute_safe", "demo_outputs", "pair_cell_error", "outputs_error", "demo_error",
            "is_exact", "total_cells", "grid_key", "outputs_key", "color_hist", "hist_overlap", "pair_rank_loss",
            "TargetInfo"]
 
@@ -26,12 +36,49 @@ log = logging.getLogger(__name__)
 
 #: Per-execution timeout used during search / verification (a legitimate program runs in a few ms on 30x30).
 DEFAULT_TIMEOUT_S: float = 0.1
+#: Floor of a deadline-clipped timeout: enough for a legitimate program, small enough to bound any overshoot.
+MIN_TIMEOUT_S: float = 0.01
+
+_SEARCH_DEADLINE: "contextvars.ContextVar[Optional[float]]" = contextvars.ContextVar("arcjepa_search_deadline",
+                                                                                       default=None)
+
+
+@contextlib.contextmanager
+def search_deadline(deadline: Optional[float]) -> Iterator[None]:
+    """Clip every interpreter call inside the block to ``deadline`` (``time.perf_counter()`` seconds).
+
+    Nested blocks keep the earlier of the two deadlines; ``None`` leaves the current deadline unchanged.
+    """
+    cur = _SEARCH_DEADLINE.get()
+    new = deadline if cur is None else (cur if deadline is None else min(cur, float(deadline)))
+    token = _SEARCH_DEADLINE.set(new)
+    try:
+        yield
+    finally:
+        _SEARCH_DEADLINE.reset(token)
+
+
+def clipped_timeout(timeout_s: float) -> float:
+    """``timeout_s`` clipped to the time left before the current :func:`search_deadline` (floor
+    :data:`MIN_TIMEOUT_S`); unchanged outside a deadline block."""
+    dl = _SEARCH_DEADLINE.get()
+    if dl is None:
+        return timeout_s
+    return max(min(MIN_TIMEOUT_S, timeout_s), min(timeout_s, dl - time.perf_counter()))
+
+
+def past_search_deadline() -> bool:
+    """True inside a :func:`search_deadline` block whose deadline has passed (results computed now may have been
+    cut short by a clipped timeout and must not be cached as genuine failures)."""
+    dl = _SEARCH_DEADLINE.get()
+    return dl is not None and time.perf_counter() > dl
 
 
 def execute_safe(prog: Node, grid: Grid, *, timeout_s: float = DEFAULT_TIMEOUT_S) -> Optional[Grid]:
-    """Run ``prog`` on ``grid``; return a valid Grid or ``None`` on any failure (never raises)."""
+    """Run ``prog`` on ``grid``; return a valid Grid or ``None`` on any failure (never raises).  The timeout is
+    clipped to the current :func:`search_deadline`, if any."""
     try:
-        out = execute(prog, grid, timeout_s=timeout_s)
+        out = execute(prog, grid, timeout_s=clipped_timeout(timeout_s))
     except ExecError:
         return None
     except Exception as e:  # pragma: no cover - defensive: the interpreter should only raise ExecError

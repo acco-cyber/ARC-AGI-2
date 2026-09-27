@@ -1,4 +1,4 @@
-"""The 72 typed DSL primitives (FROZEN_SPEC.md "Typed DSL") plus four structural helpers.
+"""The 72 typed DSL primitives (FROZEN_SPEC.md "Typed DSL"), four structural helpers and ten spec extensions.
 
 Every primitive function is pure and total over its typed domain or raises :class:`ExecError`.  Value
 representations (INTERFACES.md §1): GRID = ``List[List[int]]``; OBJECT = ``Object``; OBJECT_SET =
@@ -12,6 +12,14 @@ an evaluator callable as their last argument.  ``lazy`` primitives (IF) have the
 interpreter on demand.
 
 Structural helpers (outside the 72, flagged ``structural=True``): RENDER, RENDER_OBJ, RENDER_BLANK, CROP.
+
+Spec extensions (outside the 72, flagged ``extension=True``; INTERFACES.md §1 "Spec extensions"): generic ARC grid
+operations added after the 2026-09-26 solve-rate audit (docs/SOLVE_RATE_AUDIT.md) showed they were missing --
+integer scaling (UPSCALE, DOWNSCALE, DOWNSCALE_ANY, KRON_SELF, UPSCALE_NC), panel logic (PANEL_BOOL,
+PANEL_OVERLAY) and line / region filling (CONNECT_SAME, FILL_EMPTY_LINES, BBOX_FILL).  They are ordinary typed
+GRID -> GRID search primitives (not helpers): the grammar, the enumerator, mutations, the beam templates, the
+synthetic sampler and the program tokenizer all see them.  ``SPEC_PRIMITIVES`` stays exactly the 72 names of the
+frozen spec; ``EXTENSION_PRIMITIVES`` lists the extensions.
 """
 from __future__ import annotations
 
@@ -27,9 +35,9 @@ from arcjepa.dsl.types import (BOOLEANS, COLORS, LEAF_OBJ, Object, POSITION_ANCH
                                T, UNIT_DIRECTIONS)
 
 __all__ = [
-    "ExecError", "ExecContext", "Primitive", "REGISTRY", "SPEC_PRIMITIVES", "STRUCTURAL_PRIMITIVES", "CATEGORIES",
-    "by_out_type", "by_category", "make_object", "components", "paint_object", "sort_objects",
-    "MAX_OBJECTS",
+    "ExecError", "ExecContext", "Primitive", "REGISTRY", "SPEC_PRIMITIVES", "STRUCTURAL_PRIMITIVES",
+    "EXTENSION_PRIMITIVES", "CATEGORIES", "PANEL_BOOL_OPS", "by_out_type", "by_category", "make_object",
+    "components", "paint_object", "sort_objects", "grid_panels", "panel_priority", "MAX_OBJECTS",
 ]
 
 log = logging.getLogger(__name__)
@@ -66,6 +74,7 @@ class Primitive:
     category: str
     literal_args: Dict[int, Sequence] = field(default_factory=dict)
     structural: bool = False
+    extension: bool = False  # spec extension (outside the 72, a regular search primitive; see module docstring)
     needs_ctx: bool = False
     higher_order: bool = False
     lazy: bool = False
@@ -928,6 +937,285 @@ def _crop(g: Grid, o: Object) -> Grid:
     return [row[c0:c1 + 1] for row in g[r0:r1 + 1]]
 
 
+# ======================================================================================= spec extensions
+
+#: Integer literals of the scaling extensions (computed INTEGER arguments may be any factor >= 1).
+_SCALE_K: Tuple[int, ...] = (2, 3, 4, 5)
+#: PANEL_BOOL rules, indexed by the INTEGER literal: a panel cell is "on" when it is non-zero; panels are in
+#: reading order, FIRST_ONLY = on in the first panel and off in all others (A and not B), LAST_ONLY the mirror.
+PANEL_BOOL_OPS: Tuple[str, ...] = ("AND", "OR", "XOR", "NOR", "FIRST_ONLY", "LAST_ONLY")
+#: PANEL_OVERLAY priority orders (see :func:`panel_priority`); INTEGER literals are 0..9, so 8 orders.
+_PANEL_ORDERS: Tuple[int, ...] = tuple(range(8))
+
+
+def _as_factor(k: Any) -> int:
+    if isinstance(k, bool) or not isinstance(k, int) or k < 1:
+        raise ExecError(f"scale factor must be an integer >= 1, got {k!r}")
+    return k
+
+
+def _as_color(c: Any) -> int:
+    if isinstance(c, bool) or not isinstance(c, int) or not 0 <= c <= 9:
+        raise ExecError(f"colour expected, got {c!r}")
+    return c
+
+
+def _upscale(g: Grid, k: int) -> Grid:
+    """Every cell becomes a ``k`` x ``k`` block (raises when a side would exceed 30)."""
+    k = _as_factor(k)
+    h, w = _shape(g)
+    _check_dims(h * k, w * k)
+    out: Grid = []
+    for row in g:
+        big = [v for v in row for _ in range(k)]
+        out.extend(list(big) for _ in range(k))
+    return out
+
+
+def _downscale(g: Grid, k: int, any_nonzero: bool) -> Grid:
+    """Each ``k`` x ``k`` block becomes one cell: its most frequent colour (``any_nonzero``: its most frequent
+    non-zero colour, 0 only for an all-zero block); ties go to the larger colour.  Raises unless k divides H, W."""
+    k = _as_factor(k)
+    h, w = _shape(g)
+    if h % k or w % k:
+        raise ExecError(f"grid {h}x{w} does not split into {k}x{k} blocks")
+    out: Grid = []
+    for r in range(0, h, k):
+        orow: List[int] = []
+        for c in range(0, w, k):
+            counts: Dict[int, int] = {}
+            for rr in range(r, r + k):
+                row = g[rr]
+                for cc in range(c, c + k):
+                    v = row[cc]
+                    counts[v] = counts.get(v, 0) + 1
+            if any_nonzero:
+                counts.pop(0, None)
+                if not counts:
+                    orow.append(0)
+                    continue
+            orow.append(max(counts, key=lambda col: (counts[col], col)))
+        out.append(orow)
+    return out
+
+
+def _downscale_major(g: Grid, k: int) -> Grid:
+    return _downscale(g, k, False)
+
+
+def _downscale_any(g: Grid, k: int) -> Grid:
+    return _downscale(g, k, True)
+
+
+def _upscale_nc(g: Grid) -> Grid:
+    """UPSCALE by the number of distinct non-zero colours of ``g`` (raises when ``g`` has none)."""
+    k = len({v for row in g for v in row if v})
+    if k < 1:
+        raise ExecError("UPSCALE_NC on a grid without non-zero colours")
+    return _upscale(g, k)
+
+
+def _kron_self(g: Grid) -> Grid:
+    """Self-Kronecker product: every non-zero cell becomes a copy of the whole grid, every 0 an empty block."""
+    h, w = _shape(g)
+    _check_dims(h * h, w * w)
+    out = _blank(h * h, w * w)
+    for r in range(h):
+        for c in range(w):
+            if g[r][c]:
+                for rr in range(h):
+                    out[r * h + rr][c * w:(c + 1) * w] = g[rr]
+    return out
+
+
+def grid_panels(g: Grid) -> List[Grid]:
+    """Split ``g`` into equally-shaped panels (reading order).
+
+    Separators are full rows and/or columns of one colour (non-zero colours are tried first, then 0); a colour
+    qualifies when splitting at its lines yields >= 2 non-empty panels of identical shape.  Without separators the
+    grid is cut into two halves: left / right when W is even and W >= 2H - 1, else top / bottom when H is even.
+    Raises :class:`ExecError` when none of these applies.
+    """
+    h, w = _shape(g)
+    row_col: Dict[int, List[int]] = {}
+    for r, row in enumerate(g):
+        v = row[0]
+        if all(x == v for x in row):
+            row_col.setdefault(v, []).append(r)
+    col_col: Dict[int, List[int]] = {}
+    for c in range(w):
+        v = g[0][c]
+        if all(g[r][c] == v for r in range(h)):
+            col_col.setdefault(v, []).append(c)
+    for col in (1, 2, 3, 4, 5, 6, 7, 8, 9, 0):
+        rows = row_col.get(col, [])
+        cols = col_col.get(col, [])
+        if (not rows and not cols) or len(rows) == h or len(cols) == w:
+            continue
+        rb = [-1] + rows + [h]
+        cb = [-1] + cols + [w]
+        spans_r = [(a + 1, b) for a, b in zip(rb, rb[1:]) if b - a > 1]
+        spans_c = [(a + 1, b) for a, b in zip(cb, cb[1:]) if b - a > 1]
+        if len(spans_r) * len(spans_c) < 2:
+            continue
+        if len({b - a for a, b in spans_r}) != 1 or len({b - a for a, b in spans_c}) != 1:
+            continue
+        return [[row[c0:c1] for row in g[r0:r1]] for r0, r1 in spans_r for c0, c1 in spans_c]
+    if w % 2 == 0 and w >= 2 * h - 1:
+        half = w // 2
+        return [[row[:half] for row in g], [row[half:] for row in g]]
+    if h % 2 == 0:
+        half = h // 2
+        return [[list(row) for row in g[:half]], [list(row) for row in g[half:]]]
+    raise ExecError("no panel structure")
+
+
+def _panel_bool(g: Grid, op: int, color: int) -> Grid:
+    """Cell-wise boolean rule :data:`PANEL_BOOL_OPS` ``[op]`` over the panels' non-zero masks; on -> ``color``."""
+    if isinstance(op, bool) or not isinstance(op, int) or not 0 <= op < len(PANEL_BOOL_OPS):
+        raise ExecError(f"PANEL_BOOL op must be 0..{len(PANEL_BOOL_OPS) - 1}, got {op!r}")
+    color = _as_color(color)
+    ps = grid_panels(g)
+    n = len(ps)
+    ph, pw = _shape(ps[0])
+    out = _blank(ph, pw)
+    for r in range(ph):
+        orow = out[r]
+        for c in range(pw):
+            bits = [p[r][c] != 0 for p in ps]
+            k = sum(bits)
+            if op == 0:
+                on = k == n
+            elif op == 1:
+                on = k > 0
+            elif op == 2:
+                on = k % 2 == 1
+            elif op == 3:
+                on = k == 0
+            elif op == 4:
+                on = bits[0] and k == 1
+            else:
+                on = bits[-1] and k == 1
+            if on:
+                orow[c] = color
+    return out
+
+
+def panel_priority(n: int, k: int) -> List[int]:
+    """Panel indices from highest to lowest priority for PANEL_OVERLAY literal ``k`` over ``n`` panels.
+
+    ``k`` in ``0..n-1``: reading order rotated to start at panel ``k``; ``k`` in ``n..2n-1``: the reverse of the
+    rotation starting at ``k - n``.  These 2n orders are the dihedral re-orderings of the panel sequence (all 6
+    orders of 3 panels, 8 of the 24 orders of 4 panels); ``k >= 2n`` raises :class:`ExecError`.
+    """
+    if isinstance(k, bool) or not isinstance(k, int) or not 0 <= k < 2 * n:
+        raise ExecError(f"PANEL_OVERLAY order {k!r} outside 0..{2 * n - 1} for {n} panels")
+    s = k % n
+    order = [(s + i) % n for i in range(n)]
+    return order if k < n else order[::-1]
+
+
+def _panel_overlay(g: Grid, k: int) -> Grid:
+    """Stack the panels: each output cell takes the non-zero colour of the highest-priority panel (else 0)."""
+    ps = grid_panels(g)
+    order = panel_priority(len(ps), k)
+    ph, pw = _shape(ps[0])
+    out = _blank(ph, pw)
+    for i in reversed(order):  # lowest priority first, so higher priorities overwrite
+        p = ps[i]
+        for r in range(ph):
+            prow, orow = p[r], out[r]
+            for c in range(pw):
+                if prow[c]:
+                    orow[c] = prow[c]
+    return out
+
+
+def _connect_same(g: Grid, color: int) -> Grid:
+    """Fill the background between two equally coloured cells on the same row or column (only background in
+    between) with ``color``; ``color`` 0 means the pair's own colour.  Row-major, horizontal before vertical; every
+    test reads the input grid, so the result does not depend on the order."""
+    color = _as_color(color)
+    h, w = _shape(g)
+    out = _copy(g)
+    for r in range(h):
+        row = g[r]
+        for c in range(w):
+            v = row[c]
+            if not v:
+                continue
+            fill = color or v
+            cc = c + 1
+            while cc < w and row[cc] == 0:
+                cc += 1
+            if cc < w and cc > c + 1 and row[cc] == v:
+                orow = out[r]
+                for x in range(c + 1, cc):
+                    orow[x] = fill
+            rr = r + 1
+            while rr < h and g[rr][c] == 0:
+                rr += 1
+            if rr < h and rr > r + 1 and g[rr][c] == v:
+                for y in range(r + 1, rr):
+                    out[y][c] = fill
+    return out
+
+
+def _fill_empty_lines(g: Grid, color: int) -> Grid:
+    """Rows / columns whose interior (the grid minus its outermost ring) is all background get their interior
+    painted ``color``.  Grids thinner than 3 are returned unchanged."""
+    color = _as_color(color)
+    h, w = _shape(g)
+    out = _copy(g)
+    if h < 3 or w < 3:
+        return out
+    for r in range(1, h - 1):
+        if not any(g[r][c] for c in range(1, w - 1)):
+            for c in range(1, w - 1):
+                out[r][c] = color
+    for c in range(1, w - 1):
+        if not any(g[r][c] for r in range(1, h - 1)):
+            for r in range(1, h - 1):
+                out[r][c] = color
+    return out
+
+
+def _bbox_fill(g: Grid, color: int) -> Grid:
+    """Paint the background cells inside the bounding box of every 8-connected (colour-agnostic) non-zero
+    component with ``color``."""
+    color = _as_color(color)
+    h, w = _shape(g)
+    seen = [[False] * w for _ in range(h)]
+    boxes: List[Tuple[int, int, int, int]] = []
+    for r in range(h):
+        for c in range(w):
+            if not g[r][c] or seen[r][c]:
+                continue
+            seen[r][c] = True
+            r0 = r1 = r
+            c0 = c1 = c
+            dq = deque([(r, c)])
+            while dq:
+                cr, cc = dq.popleft()
+                r0, r1 = min(r0, cr), max(r1, cr)
+                c0, c1 = min(c0, cc), max(c1, cc)
+                for dr in (-1, 0, 1):
+                    for dc in (-1, 0, 1):
+                        nr, nc = cr + dr, cc + dc
+                        if 0 <= nr < h and 0 <= nc < w and not seen[nr][nc] and g[nr][nc]:
+                            seen[nr][nc] = True
+                            dq.append((nr, nc))
+            boxes.append((r0, c0, r1, c1))
+    out = _copy(g)
+    for r0, c0, r1, c1 in boxes:
+        for r in range(r0, r1 + 1):
+            grow, orow = g[r], out[r]
+            for c in range(c0, c1 + 1):
+                if grow[c] == 0:
+                    orow[c] = color
+    return out
+
+
 # ======================================================================================= registry
 
 REGISTRY: Dict[str, Primitive] = {}
@@ -1030,10 +1318,25 @@ _reg("RENDER", [OS, G], G, _render, "structural", structural=True)
 _reg("RENDER_OBJ", [O, G], G, _render_obj, "structural", structural=True)
 _reg("RENDER_BLANK", [OS, G], G, _render_blank, "structural", structural=True)
 _reg("CROP", [G, O], G, _crop, "structural", structural=True)
+# spec extensions (outside the 72; regular typed search primitives, see the module docstring)
+_NZ_COLORS: Tuple[int, ...] = tuple(c for c in COLORS if c)  # colour 0 would make these ops an identity / blank
+_reg("UPSCALE", [G, I], G, _upscale, "pattern", {1: _SCALE_K}, extension=True)
+_reg("DOWNSCALE", [G, I], G, _downscale_major, "pattern", {1: _SCALE_K}, extension=True)
+_reg("DOWNSCALE_ANY", [G, I], G, _downscale_any, "pattern", {1: _SCALE_K}, extension=True)
+_reg("KRON_SELF", [G], G, _kron_self, "pattern", extension=True)
+_reg("UPSCALE_NC", [G], G, _upscale_nc, "pattern", extension=True)
+_reg("PANEL_BOOL", [G, I, C], G, _panel_bool, "pattern", {1: tuple(range(len(PANEL_BOOL_OPS))), 2: _NZ_COLORS},
+     extension=True)
+_reg("PANEL_OVERLAY", [G, I], G, _panel_overlay, "pattern", {1: _PANEL_ORDERS}, extension=True)
+_reg("CONNECT_SAME", [G, C], G, _connect_same, "manipulation", {1: COLORS}, extension=True)
+_reg("FILL_EMPTY_LINES", [G, C], G, _fill_empty_lines, "manipulation", {1: _NZ_COLORS}, extension=True)
+_reg("BBOX_FILL", [G, C], G, _bbox_fill, "manipulation", {1: _NZ_COLORS}, extension=True)
 
-SPEC_PRIMITIVES: Tuple[str, ...] = tuple(n for n, p in REGISTRY.items() if not p.structural)
+SPEC_PRIMITIVES: Tuple[str, ...] = tuple(n for n, p in REGISTRY.items() if not p.structural and not p.extension)
 STRUCTURAL_PRIMITIVES: Tuple[str, ...] = tuple(n for n, p in REGISTRY.items() if p.structural)
+EXTENSION_PRIMITIVES: Tuple[str, ...] = tuple(n for n, p in REGISTRY.items() if p.extension)
 assert len(SPEC_PRIMITIVES) == 72, len(SPEC_PRIMITIVES)
+assert not any(p.structural and p.extension for p in REGISTRY.values())
 
 
 def by_out_type(t: T, include_structural: bool = True) -> List[Primitive]:

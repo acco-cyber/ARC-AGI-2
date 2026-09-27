@@ -63,10 +63,24 @@ def test_configs_load_and_inherit() -> None:
     assert dbg["stages"]["A"]["lr"] == pytest.approx(1.5e-4)  # inherited from base
     assert dbg["eval"]["retrieval_k"] == [1, 4]
     assert dbg["synthetic"]["n_tasks"] == 200
+    assert (base["stages"]["A"]["batch_size"], base["stages"]["B"]["batch_size"]) == (128, 32)  # spec per-GPU
     for name in ("l4x4", "kaggle"):
         c = C.load_config(ROOT / "configs" / f"{name}.yaml")
-        assert c["training"]["precision"] == "bf16" and c["stages"]["A"]["batch_size"] == 64
-    assert C.load_config(ROOT / "configs" / "kaggle.yaml")["export"]["dir"] == "/kaggle/working/arc_jepa_pkg"
+        assert c["training"]["precision"] == "bf16"
+        st = c["stages"]
+        # measured per-GPU micro-batches that fit a 22 GiB L4 (8 x ~1.3 GB stage-A / 4 x ~2.4 GB stage-B episodes at
+        # 30x30 in bf16), with gradient accumulation up to the documented global batches over 4 GPUs
+        assert {s: (st[s]["batch_size"], st[s]["accum_steps"]) for s in "ABCD"} == {
+            "A": (8, 8), "B": (4, 8), "C": (8, 8), "D": (8, 4)}
+        assert {s: st[s]["batch_size"] * st[s]["accum_steps"] * 4 for s in "ABCD"} == {
+            "A": 256, "B": 128, "C": 256, "D": 128}
+        assert c["training"]["oom_max_split"] == 2  # a CUDA OOM halves the micro-batch once
+        fr = c["training"]["time_fractions"]
+        assert set(fr) == set("ABCD") and sum(fr.values()) == pytest.approx(1.0) and fr["A"] > 0.5 > fr["B"] > 0
+        assert "sdg_hard" not in st["B"]["configs"] and not st["B"]["allow_sdg_hard"]
+    kag = C.load_config(ROOT / "configs" / "kaggle.yaml")
+    assert kag["export"]["dir"] == "/kaggle/working/arc_jepa_pkg"
+    assert kag["memory"]["pseudo_label_total_seconds"] <= 300 and kag["memory"]["max_synthetic"] == 20000
     mc = C.model_config_from(dbg)
     assert mc.name == "tiny" and mc.cell_dim == 64 and mc.rule_dim == 64
     assert C.model_config_from(base).jepa_dim == 512
@@ -78,6 +92,18 @@ def test_lr_multiplier_warmup_and_cosine() -> None:
     assert all(a >= b - 1e-12 for a, b in zip(vals[9:], vals[10:]))  # monotone after warmup
     assert C.lr_multiplier(100, 100, 10, 0.01) == pytest.approx(0.01)
     assert C.lr_multiplier(0, 1, 5, 0.0) == pytest.approx(1.0)
+
+
+def test_time_shrunk_schedule_keeps_warmup_fraction() -> None:
+    # stage A on 4 x L4: ~18.5k epoch-planned steps with a 10 % warmup, but the time box allows ~3k
+    total, warmup = C.shrink_schedule(4, 18_550, 1_855, 0.1, sec_per_step=3.5, seconds_left=3.5 * 2_996)
+    assert total == 3_000 and warmup == 300
+    assert C.lr_multiplier(300, total, warmup, 0.01) == pytest.approx(1.0, abs=1e-3)  # peak lr reached at 10 %
+    # a later, faster estimate never grows the schedule or the warmup back
+    assert C.shrink_schedule(500, total, warmup, 0.1, 1.0, 1e9) == (3_000, 300)
+    # a slower estimate shrinks both again, never below step + 1
+    assert C.shrink_schedule(500, total, warmup, 0.1, 10.0, 10.0 * 1_500) == (2_000, 200)
+    assert C.shrink_schedule(900, 2_000, 200, 0.1, 10.0, 0.0) == (901, 90)
 
 
 def test_stage_budget_split() -> None:
@@ -226,11 +252,18 @@ def test_train_all_debug_end_to_end_and_package(tmp_path: Path) -> None:
     programs = json.loads((pkg / "programs.json").read_text(encoding="utf-8"))["records"]
     from arcjepa.data.hf_loader import EVAL_PUBLIC
 
+    # the exported memory holds only synthetic train-split tasks and 700-split training tasks
+    assert {r.get("source") for r in programs} <= {"synthetic", "arc"}
+    assert all(str(r["task_id"]).startswith("syn") for r in programs if r.get("source") == "synthetic")
     if _has_data():
+        from arcjepa.data.hf_loader import load_resplit
         from arcjepa.training.train_real import official_task_splits
 
         splits = official_task_splits()
         assert all(splits.get(r["task_id"]) != EVAL_PUBLIC for r in programs if r.get("source") == "arc")
+        train700 = set(load_resplit()["train"])
+        arc_ids = [r["task_id"] for r in programs if r.get("source") == "arc"]
+        assert arc_ids and set(arc_ids) <= train700
     # the loaded model reproduces the trained weights exactly
     state = torch.load(out / "checkpoints" / "last.pt", map_location="cpu", weights_only=False)
     ref = ARCJEPA(model.cfg, model.tokenizer)
@@ -246,3 +279,179 @@ def test_train_all_debug_end_to_end_and_package(tmp_path: Path) -> None:
     # a second invocation resumes: every stage is already complete, so it only re-exports
     summary2 = main(args)
     assert summary2["stages"] == {} and summary2["completed"] == summary["completed"]
+    assert meta["export_complete"] is True
+
+
+# ------------------------------------------------------------------------------------------------ 09-26 fixes
+def test_stage_b_refuses_sdg_hard_and_configs_exclude_it() -> None:
+    from arcjepa.training.train_real import DEFAULT_CONFIGS, stage_b_configs
+
+    assert "sdg_hard" not in DEFAULT_CONFIGS
+    for name in ("base", "debug", "l4x4", "kaggle"):
+        b = C.load_config(ROOT / "configs" / f"{name}.yaml")["stages"]["B"]
+        assert "sdg_hard" not in (b.get("configs") or DEFAULT_CONFIGS), name
+        assert not b.get("allow_sdg_hard"), name
+        assert stage_b_configs(b)[1] == set()
+    with pytest.raises(EvalLeakError):
+        stage_b_configs({"configs": ["episodes", "sdg_hard"]})
+    with pytest.raises(EvalLeakError):
+        stage_b_configs({"configs": ["sdg_hard"], "allow_sdg_hard": False, "sdg_allowlist": ["x"]})
+    confs, allow = stage_b_configs({"configs": ["sdg_hard"], "allow_sdg_hard": True, "sdg_allowlist": ["abc"]})
+    assert confs == ["sdg_hard"] and allow == {"abc"}
+
+
+@pytest.mark.skipif(not _has_data(), reason="local HF mirror not available")
+def test_stage_b_keeps_only_700_train_ids_and_memory_is_train_only() -> None:
+    from arcjepa.data.hf_loader import load_resplit
+    from arcjepa.training.train_all import memory_sources
+    from arcjepa.training.train_real import load_real_data
+
+    splits = load_resplit()
+    train_ids = set(splits["train"])
+    cfg = C.load_config(DEBUG_CFG, ["stages.B.max_per_config=40", "stages.B.val_episodes=4"])
+    eps, fams, val = load_real_data(cfg)
+    assert eps and len(eps) == len(fams)
+    assert {e.task_id for e in eps} <= train_ids
+    assert {e.task_id for e in val} <= set(splits["val"])
+    # opting into sdg_hard with an empty allowlist still admits no sdg row
+    cfg2 = C.load_config(DEBUG_CFG, ["stages.B.configs=[sdg_hard]", "stages.B.allow_sdg_hard=true",
+                                     "stages.B.max_per_config=40", "stages.B.val_episodes=0"])
+    eps2, _, _ = load_real_data(cfg2)
+    assert eps2 == []
+    # memory: real tasks are 700-split train ids only; blocked = eval + val + holdout
+    _, real, _, blocked = memory_sources(C.load_config(DEBUG_CFG, ["memory.max_real=12"]), None, [])
+    assert real and set(real) <= train_ids and not set(real) & set(blocked)
+    assert set(splits["val"]) <= set(blocked) and set(splits["holdout"]) <= set(blocked)
+
+
+def test_init_distributed_sets_long_collective_timeout(monkeypatch) -> None:
+    import datetime
+
+    import torch.distributed as tdist
+
+    seen: Dict[str, Any] = {}
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setenv("RANK", "1")
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    monkeypatch.setattr(tdist, "is_initialized", lambda: False)
+    monkeypatch.setattr(tdist, "init_process_group", lambda **kw: seen.update(kw))
+    d = C.init_distributed("cpu")
+    assert d.enabled and d.rank == 1 and not d.is_main
+    assert seen["backend"] == "gloo" and seen["timeout"] >= datetime.timedelta(hours=1)
+
+
+def test_train_all_leaves_process_group_before_export(tmp_path: Path, monkeypatch) -> None:
+    """Every rank tears the process group down before rank 0 exports (no collective pending in the export)."""
+    from arcjepa.training import export as E
+    from arcjepa.training import train_all as TA
+
+    calls: List[str] = []
+    real_cleanup, real_export = TA.cleanup_distributed, E.export_package
+    monkeypatch.setattr(TA, "cleanup_distributed", lambda d: (calls.append("cleanup"), real_cleanup(d)))
+    monkeypatch.setattr(E, "export_package", lambda *a, **k: (calls.append("export"), real_export(*a, **k))[1])
+    args = ["--config", str(DEBUG_CFG), "--hours", "0.02", "--out", str(tmp_path / "run"), "--stages", "A"]
+    for ov in FAST + ["memory.include_real=false"]:
+        args += ["--set", ov]
+    summary = TA.main(args)
+    assert calls[:2] == ["cleanup", "export"], calls
+    assert summary["package"]["memory_size"] > 0
+
+
+def test_export_writes_loadable_package_before_memory(tmp_path: Path, monkeypatch) -> None:
+    from arcjepa.training import export as E
+
+    cfg = C.load_config(DEBUG_CFG, FAST)
+    model = C.build_model(cfg)
+
+    def boom(*a: Any, **k: Any) -> Any:
+        raise RuntimeError("killed while building the memory")
+
+    monkeypatch.setattr(E, "build_program_memory", boom)
+    with pytest.raises(RuntimeError):
+        E.export_package(model, cfg, tmp_path / "pkg")
+    meta = json.loads((tmp_path / "pkg" / "config.json").read_text(encoding="utf-8"))
+    assert meta["export_complete"] is False
+    loaded = ARCJEPA.load_package(tmp_path / "pkg")  # loadable without memory
+    assert loaded.memory is None and loaded.cfg.rule_dim == model.cfg.rule_dim
+    assert E.resolve_export_device("auto").type == ("cuda" if torch.cuda.is_available() else "cpu")
+    assert E.resolve_export_device("cpu").type == "cpu"
+
+
+def test_pseudo_label_total_budget_caps_the_search(monkeypatch) -> None:
+    from arcjepa.core.types import Pair, Task
+    from arcjepa.training import export as E
+
+    seen: List[float] = []
+
+    def fake(task: Any, seconds: float) -> Any:  # a search that uses its whole budget
+        import time
+
+        seen.append(seconds)
+        time.sleep(seconds)
+        return None
+
+    monkeypatch.setattr(E, "pseudo_label", fake)
+    cfg = C.load_config(DEBUG_CFG, FAST)
+    model = C.build_model(cfg)
+    g = [[1, 0], [0, 1]]
+    tasks = {f"t{i}": Task(f"t{i}", [Pair(g, g), Pair(g, g)], [Pair(g, g)]) for i in range(6)}
+    mem = E.build_program_memory(model, real_tasks=tasks, pseudo_label_seconds=0.5, pseudo_label_total_seconds=0.9)
+    assert len(mem) == 6 and seen and all(s <= 0.5 for s in seen)
+    assert sum(seen) <= 0.9 + 1e-6
+
+
+def test_bf16_autocast_forward_backward_tiny() -> None:
+    """The CUDA bf16 path (never run on CPU by the trainer) emulated with CPU autocast: no dtype errors."""
+    from arcjepa.model.losses import jepa_losses
+
+    from arcjepa.core.types import Episode, Pair
+
+    cfg = C.load_config(DEBUG_CFG, FAST)
+    C.set_seed(0)
+    model = C.build_model(cfg)
+    target = C.build_target(model)
+    g = [[(r * 3 + c) % 10 for c in range(6)] for r in range(5)]
+    eps = [Episode(episode_id=f"e{i}", task_id=f"e{i}", split="synthetic",
+                   context=[Pair(g, [row[::-1] for row in g]) for _ in range(3)], test_input=g,
+                   target_output=[row[::-1] for row in g], source="synthetic") for i in range(2)]
+    batch = C.collate_items([C.encode_item(e, C.resolve_parser(None), 3, out_objects=True) for e in eps])
+    progs = ["(REFLECT_V INPUT)", "(REFLECT_H INPUT)"]
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        out = jepa_losses(model, target, batch, programs_pos=progs, programs_neg=[[progs[1]], [progs[0]]],
+                          weights=C.loss_weights(cfg, {}))
+    assert torch.isfinite(out["total"].float())
+    out["total"].float().backward()
+    assert any(p.grad is not None for p in model.encoder.parameters())
+    rel = model.encoder.relations
+    n = model.cfg.max_objects
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        full, pooled = rel(torch.randn(2, n, model.cfg.object_dim), torch.rand(2, n, n, model.cfg.rel_feat_dim),
+                           torch.arange(n).expand(2, n) < 5, return_tokens=True)
+    assert full.shape[:3] == (2, n, n) and torch.isfinite(full.float()).all()
+
+
+def test_run_stage_halves_micro_batch_on_cuda_oom(synth: Dict[str, Any], tmp_path: Path, monkeypatch) -> None:
+    from arcjepa.training.train_program_encoder import run_stage_d
+
+    cfg = C.load_config(DEBUG_CFG, FAST + ["stages.D.max_steps=2", "eval.every_steps=0"])
+    ctx = _ctx(cfg, synth, tmp_path)
+    real = C.jepa_losses
+    sizes: List[int] = []
+
+    def flaky(model: Any, target: Any, batch: Dict[str, Any], **kw: Any) -> Any:
+        n = int(batch["ctx_in"].shape[0])
+        sizes.append(n)
+        if n > 1:
+            raise torch.cuda.OutOfMemoryError("CUDA out of memory. Tried to allocate 2.00 GiB")
+        return real(model, target, batch, **kw)
+
+    monkeypatch.setattr(C, "jepa_losses", flaky)
+    summ = run_stage_d(ctx, 120.0)
+    assert summ["steps"] == 2 and summ["oom_split"] == 2
+    assert sizes[0] == 2 and set(sizes[1:]) == {1}
+    assert any(r["kind"] == "oom" for r in ctx.metrics.read())
+    # an OOM that persists at the halved micro-batch is re-raised (halving happens once by default)
+    monkeypatch.setattr(C, "jepa_losses", lambda *a, **k: (_ for _ in ()).throw(torch.cuda.OutOfMemoryError("x")))
+    with pytest.raises(torch.cuda.OutOfMemoryError):
+        run_stage_d(_ctx(cfg, synth, tmp_path / "b"), 120.0)
+    assert C.split_bounds(5, 2) == [(0, 2), (2, 5)] and C.split_bounds(1, 4) == [(0, 1)]

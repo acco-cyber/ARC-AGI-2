@@ -1,0 +1,28 @@
+﻿[{"stream_name":"stderr","time":6.712515556,"data":"0.00s - Debugger warning: It seems that frozen modules are being used, which may\n"}
+,{"stream_name":"stderr","time":6.71256523,"data":"0.00s - make the debugger miss breakpoints. Please pass -Xfrozen_modules=off\n"}
+,{"stream_name":"stderr","time":6.712569025,"data":"0.00s - to python to disable frozen modules.\n"}
+,{"stream_name":"stderr","time":6.712571172,"data":"0.00s - Note: Debugging will proceed. Set PYDEVD_DISABLE_FILE_VALIDATION=1 to disable this validation.\n"}
+,{"stream_name":"stderr","time":7.451982322,"data":"0.00s - Debugger warning: It seems that frozen modules are being used, which may\n"}
+,{"stream_name":"stderr","time":7.452006711,"data":"0.00s - make the debugger miss breakpoints. Please pass -Xfrozen_modules=off\n"}
+,{"stream_name":"stderr","time":7.452009416,"data":"0.00s - to python to disable frozen modules.\n"}
+,{"stream_name":"stderr","time":7.452011586,"data":"0.00s - Note: Debugging will proceed. Set PYDEVD_DISABLE_FILE_VALIDATION=1 to disable this validation.\n"}
+,{"stream_name":"stdout","time":10.002618297,"data":"mode: dev (public evaluation)\n"}
+,{"stream_name":"stdout","time":10.181417835,"data":"fallback submission written for 240 test tasks (259 test inputs)\n"}
+,{"stream_name":"stdout","time":10.550636809,"data":"code source: /kaggle/input/datasets/poby7722/arc-jepa-code -\u003e copied to /kaggle/working/arc-jepa | import ok: True\n"}
+,{"stream_name":"stdout","time":10.558828348,"data":"episodes dataset: /kaggle/input/datasets/poby7722/arc-agi-2-jepa-episodes\n"}
+,{"stream_name":"stdout","time":15.358720265,"data":"code: True | runner: True | package: /kaggle/input/notebooks/poby7722/arc-jepa-train/arc_jepa_pkg | GPUs 4 | CPUs 48 | workers 16\n"}
+,{"stream_name":"stdout","time":15.556118555,"data":"dev tasks: 120\n"}
+,{"stream_name":"stdout","time":735.960294396,"data":"COMPETITION METRIC (public eval, 120 tasks): 0.0083  [cross-check 0.0083]\n"}
+,{"stream_name":"stdout","time":735.960331942,"data":"outputs solved: 1 / 172 | solver errors 0 | exact programs found on 0 tasks\n"}
+,{"stream_name":"stdout","time":735.960335892,"data":"per family: {\"composition\": {\"n\": 10, \"score\": 0.0}, \"context\": {\"n\": 51, \"score\": 0.0196078431372549}, \"counting\": {\"n\": 2, \"score\": 0.0}, \"object\": {\"n\": 52, \"score\": 0.0}, \"relation\": {\"n\": 2, \"score\": 0.0}, \"symmetry\": {\"n\": 3, \"score\": 0.0}}\n"}
+,{"stream_name":"stdout","time":735.960341264,"data":"near misses: {\"near_miss_90\": 48, \"near_miss_95\": 22, \"near_miss_99\": 1}\n"}
+,{"stream_name":"stdout","time":735.990517168,"data":"submission.json: 240 tasks, valid = True, 12.1 min elapsed\n"}
+,{"stream_name":"stderr","time":740.684674912,"data":"/usr/local/lib/python3.11/dist-packages/traitlets/traitlets.py:2915: FutureWarning: --Exporter.preprocessors=[\"remove_papermill_header.RemovePapermillHeader\"] for containers is deprecated in traitlets 5.0. You can pass `--Exporter.preprocessors item` ... multiple times to add items to a list.\n"}
+,{"stream_name":"stderr","time":740.684699266,"data":"  warn(\n"}
+,{"stream_name":"stderr","time":740.733161818,"data":"[NbConvertApp] Converting notebook __notebook__.ipynb to notebook\n"}
+,{"stream_name":"stderr","time":741.033648609,"data":"[NbConvertApp] Writing 30590 bytes to __notebook__.ipynb\n"}
+,{"stream_name":"stderr","time":742.311233918,"data":"/usr/local/lib/python3.11/dist-packages/traitlets/traitlets.py:2915: FutureWarning: --Exporter.preprocessors=[\"nbconvert.preprocessors.ExtractOutputPreprocessor\"] for containers is deprecated in traitlets 5.0. You can pass `--Exporter.preprocessors item` ... multiple times to add items to a list.\n"}
+,{"stream_name":"stderr","time":742.311263575,"data":"  warn(\n"}
+,{"stream_name":"stderr","time":742.336934264,"data":"[NbConvertApp] Converting notebook __notebook__.ipynb to html\n"}
+,{"stream_name":"stderr","time":743.153272825,"data":"[NbConvertApp] Writing 373225 bytes to __results__.html\n"}
+]

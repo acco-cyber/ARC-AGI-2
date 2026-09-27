@@ -195,7 +195,69 @@ def test_make_task_fixed_program_and_n_pairs() -> None:
             assert p.output == [row[::-1] for row in p.input] or p.output == p.input[::-1]
 
 
+#: One depth-1 program per spec extension (INTERFACES.md §1) with the input shape hint it needs.
+EXTENSION_PROGRAMS = {
+    "(UPSCALE INPUT 3)": ("small", 3), "(DOWNSCALE INPUT 2)": ("blocks", 2),
+    "(DOWNSCALE_ANY INPUT 3)": ("blocks_any", 3), "(KRON_SELF INPUT)": ("kron", None),
+    "(UPSCALE_NC INPUT)": ("small", 4), "(PANEL_BOOL INPUT 2 4)": ("panels", None),
+    "(PANEL_OVERLAY INPUT 5)": ("panels", 3), "(CONNECT_SAME INPUT 0)": None, "(FILL_EMPTY_LINES INPUT 3)": None,
+    "(BBOX_FILL INPUT 2)": None,
+}
+
+
+def test_make_task_builds_valid_tasks_for_every_spec_extension() -> None:
+    from arcjepa.dsl.primitives import EXTENSION_PRIMITIVES, grid_panels
+    from arcjepa.synthetic.dataset import input_shape_hint
+    assert {Node.from_str(s).op for s in EXTENSION_PROGRAMS} == set(EXTENSION_PRIMITIVES)
+    for src, hint in EXTENSION_PROGRAMS.items():
+        prog = Node.from_str(src)
+        assert input_shape_hint(prog) == hint, src
+        rng = random.Random(1)
+        tasks = [make_task(rng, program=src) for _ in range(20)]
+        tasks = [t for t in tasks if t is not None]
+        assert len(tasks) >= 12, (src, len(tasks))  # random ARC-like inputs alone almost never fit KRON / panels
+        for t in tasks:
+            assert t.program == src and t.primitives == [prog.op]
+            for p in t.pairs:
+                assert execute(prog, p.input) == p.output
+                if hint is not None and hint[0] == "kron":
+                    assert len(p.input) <= 5 and len(p.input[0]) <= 5
+                if hint is not None and hint[0] == "panels" and hint[1] is not None:
+                    assert len(grid_panels(p.input)) >= hint[1]  # order literal 5 needs >= 3 panels
+    assert input_shape_hint(Node.from_str("(ROTATE90 INPUT)")) is None
+    assert input_shape_hint(Node.from_str("(UPSCALE (KRON_SELF INPUT) 2)")) == ("kron", None)  # KRON first
+
+
+def test_sampler_weights_cover_the_extensions_and_the_uniform_sampler_is_kept() -> None:
+    from arcjepa.dsl.primitives import EXTENSION_PRIMITIVES
+    from arcjepa.synthetic.program_sampler import PRIMITIVE_WEIGHTS
+    assert set(EXTENSION_PRIMITIVES) <= set(PRIMITIVE_WEIGHTS) and all(w > 0 for w in PRIMITIVE_WEIGHTS.values())
+    rng = random.Random(8)
+    used: Counter = Counter()
+    for _ in range(3000):
+        used.update(sample_program(rng, max_tries=2).primitives())
+    assert set(EXTENSION_PRIMITIVES) <= set(used), set(EXTENSION_PRIMITIVES) - set(used)
+    # weights=None is the uniform sampler: the same stream as random_expression without a weight table
+    a = [sample_program(random.Random(3), weights=None).to_str() for _ in range(5)]
+    b = [sample_program(random.Random(3), weights=None).to_str() for _ in range(5)]
+    assert a == b
+
+
 # ======================================================================================= generated dataset
+
+def test_generated_tasks_exercise_every_spec_extension(generated: Dict[str, Any]) -> None:
+    """The synthetic training data contains every extension op (INTERFACES.md §1: measured 4-6 % of the tasks
+    each), so the program encoder and the neural prior learn them."""
+    from arcjepa.dsl.primitives import EXTENSION_PRIMITIVES
+    rows = generated["rows"]
+    counts = Counter(p for r in rows for p in set(r["primitives"]))
+    for n in EXTENSION_PRIMITIVES:
+        assert counts[n] >= 0.02 * len(rows), (n, counts[n])
+    for r in rows:  # every such task re-executes exactly (the shaped inputs are real inputs of the program)
+        if set(r["primitives"]) & set(EXTENSION_PRIMITIVES) and r["task_id"].endswith("0"):
+            prog = Node.from_str(r["program"])
+            assert all(execute(prog, p["input"]) == p["output"] for p in r["pairs"]), r["program"]
+
 
 def test_generated_rows_schema(generated: Dict[str, Any]) -> None:
     rows = generated["rows"]
@@ -300,10 +362,14 @@ def test_load_jsonl_and_row_roundtrip(generated: Dict[str, Any]) -> None:
 
 
 def test_throughput(generated: Dict[str, Any]) -> None:
-    per_worker = generated["stats"]["tasks_per_s_per_worker"]
-    log.warning("synthetic throughput: %d tasks/s/worker (%d tasks in %.2fs)", per_worker, N_MAIN,
-                generated["seconds"])
-    assert per_worker >= 100  # target is >= 300 on an idle CPU; loose bound keeps the test stable under load
+    """Per-worker throughput is measured in worker CPU seconds (a wall-clock rate halves whenever other jobs share
+    the machine: 161 -> 72 tasks/s measured on 2026-09-27 with the same code)."""
+    st = generated["stats"]
+    per_worker = st["tasks_per_s_per_worker"]
+    log.warning("synthetic throughput: %d tasks/s/worker-CPU-s (%d tasks in %.2fs wall, %d ms CPU)", per_worker,
+                N_MAIN, generated["seconds"], st["cpu_ms"])
+    assert st["cpu_ms"] > 0 and abs(per_worker - N_MAIN * 1000.0 / st["cpu_ms"]) <= max(2.0, 0.01 * per_worker)
+    assert per_worker >= 100  # target is >= 300 on an idle CPU; loose bound for slower CPUs
 
 
 # ======================================================================================= determinism / workers / CLI

@@ -11,11 +11,16 @@ The notebook (kernel ``poby7722/arc-jepa-train``, NvidiaL4 x 4, no internet, pin
    over all GPUs, falling back to a single process (which resumes the torchrun checkpoints);
 4. makes sure the package is exported to ``/kaggle/working/arc_jepa_pkg`` and prints a summary.
 
-``ARCJEPA_SMOKE=1`` (the default, for the first push) switches to ``configs/debug.yaml``, 200 synthetic tasks and
-a few minutes of single-process training.
+``ARCJEPA_SMOKE=1`` (the default build, for the first push) switches to ``configs/debug.yaml``, 200 synthetic tasks
+and a few minutes of single-process training.
 
 Usage: ``python kaggle/build_train_nb.py [--out-dir kaggle]``. The notebook is also copied next to its metadata
 (``kaggle/train/arc-jepa-train.ipynb``) so ``kaggle/train`` is a pushable kernel folder.
+
+``python kaggle/build_train_nb.py --full`` writes the FULL-mode kernel folder ``kaggle/train_full/`` (same kernel id
+``poby7722/arc-jepa-train`` and metadata) whose notebook defaults to ``ARCJEPA_SMOKE=0`` and
+``ARCJEPA_TRAIN_HOURS=7.5`` (Kaggle cannot set environment variables): v1 model, torchrun on 4 x L4, every step
+capped at ``ARCJEPA_WALL_HOURS`` (default train hours + 1 = 8.5 h).
 """
 from __future__ import annotations
 
@@ -212,9 +217,12 @@ synthetic phase-1 tasks in-session, runs `arcjepa.training.train_all` (stages A-
 L4 GPUs with `torchrun`, and exports the offline package to `/kaggle/working/arc_jepa_pkg`, which the inference
 kernel `poby7722/arc-jepa-infer` mounts via `kernel_sources`.
 
-Environment switches: `ARCJEPA_SMOKE` (default `1` = debug config, 200 tasks, a few minutes),
-`ARCJEPA_TRAIN_HOURS` (default `9.5`), `ARCJEPA_SYNTH_TASKS` (default `100000`), `ARCJEPA_SYNTH_WORKERS`
-(default `4`), `ARCJEPA_SYNTH_MAX_MINUTES` (default `30`).
+Build mode: **__MODE__**. Environment switches (Kaggle cannot set them, so the build bakes the defaults):
+`ARCJEPA_SMOKE` (default `__SMOKE_DEFAULT__`; `1` = debug config, 200 tasks, a few minutes),
+`ARCJEPA_TRAIN_HOURS` (default `__TRAIN_HOURS_DEFAULT__`, measured from the notebook start),
+`ARCJEPA_WALL_HOURS` (default train hours + 1: hard cap for every step of the notebook),
+`ARCJEPA_SYNTH_TASKS` (default `100000`), `ARCJEPA_SYNTH_WORKERS` (default `4`),
+`ARCJEPA_SYNTH_MAX_MINUTES` (default `30`).
 """
 
 TRAIN_SETUP_SRC = r'''
@@ -226,8 +234,9 @@ import sys
 import time
 
 T0 = time.time()
-SMOKE = os.environ.get("ARCJEPA_SMOKE", "1") == "1"
-TRAIN_HOURS = float(os.environ.get("ARCJEPA_TRAIN_HOURS", "9.5"))
+SMOKE = os.environ.get("ARCJEPA_SMOKE", "__SMOKE_DEFAULT__") == "1"
+TRAIN_HOURS = float(os.environ.get("ARCJEPA_TRAIN_HOURS", "__TRAIN_HOURS_DEFAULT__"))
+WALL_HOURS = float(os.environ.get("ARCJEPA_WALL_HOURS", str(TRAIN_HOURS + 1.0)))  # hard cap for the whole notebook
 SMOKE_HOURS = float(os.environ.get("ARCJEPA_SMOKE_HOURS", "0.05"))
 SYNTH_TARGET = int(os.environ.get("ARCJEPA_SYNTH_TASKS", "100000"))
 SYNTH_WORKERS = int(os.environ.get("ARCJEPA_SYNTH_WORKERS", "4"))
@@ -240,8 +249,15 @@ PKG_DIR = os.path.join(WORK, "arc_jepa_pkg")
 SYNTH_PATH = os.path.join(WORK, "synthetic_phase1.jsonl")
 LOG_PATH = os.path.join(WORK, "train_stdout.log")
 os.makedirs(WORK, exist_ok=True)
-print("SMOKE" if SMOKE else "FULL", "run | train hours", TRAIN_HOURS, "| synthetic target", SYNTH_TARGET,
-      "x", SYNTH_WORKERS, "workers")
+
+
+def wall_left():
+    """Seconds left before the notebook's hard wall-clock cap (WALL_HOURS after T0)."""
+    return WALL_HOURS * 3600.0 - (time.time() - T0)
+
+
+print("SMOKE" if SMOKE else "FULL", "run | train hours", TRAIN_HOURS, "| wall cap hours", WALL_HOURS,
+      "| synthetic target", SYNTH_TARGET, "x", SYNTH_WORKERS, "workers")
 '''
 
 TRAIN_ENV_SRC = r'''
@@ -309,8 +325,37 @@ MARGIN_H = 0.02 if SMOKE else 0.25  # export check + summary
 
 
 def package_ok():
+    """A loadable package: config.json + weights (the export writes these before building the memory)."""
     return os.path.isfile(os.path.join(PKG_DIR, "config.json")) and any(
         os.path.isfile(os.path.join(PKG_DIR, w)) for w in ("model.safetensors", "model.pt"))
+
+
+def package_complete():
+    """A loadable package whose memory was written too (config.json "export_complete")."""
+    if not package_ok():
+        return False
+    try:
+        with open(os.path.join(PKG_DIR, "config.json"), encoding="utf-8") as fh:
+            return bool(json.load(fh).get("export_complete", True))
+    except (OSError, ValueError):
+        return False
+
+
+def stages_done():
+    """Stages recorded as finished in the run's metrics (stage_end records)."""
+    done = set()
+    try:
+        with open(os.path.join(RUN_DIR, "metrics.jsonl"), encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                if r.get("kind") == "stage_end" and r.get("stage"):
+                    done.add(r["stage"])
+    except OSError:
+        pass
+    return done
 
 
 def hours_left():
@@ -326,23 +371,49 @@ t_train = time.time()
 rc = None
 if not SMOKE and N_GPU > 1:
     h = hours_left()
+    # train_all stops its stages at h*(1 - reserve_frac) and exports in the reserve; the kill is a backstop
+    # that also leaves wall time for the fallback export below
+    limit = min(h * 3600 + 1800, wall_left() - 1800)
     rc = run_cmd([sys.executable, "-m", "torch.distributed.run", "--standalone", "--nproc_per_node=%d" % N_GPU,
-                  "-m", "arcjepa.training.train_all", "--hours", "%.4f" % h] + common, h * 3600 + 1800, LOG_PATH)
-if not package_ok():
+                  "-m", "arcjepa.training.train_all", "--hours", "%.4f" % h] + common, limit, LOG_PATH)
+if not package_complete():
     h = hours_left()
-    if not SMOKE and N_GPU > 1:
-        print("torchrun did not produce a package (exit %s); single-process fallback for %.2fh" % (rc, h))
-    rc = run_cmd([sys.executable, "-m", "arcjepa.training.train_all", "--hours", "%.4f" % h] + common,
-                 h * 3600 + 1800, LOG_PATH)
-print("training finished in %.1f min, package ok: %s" % ((time.time() - t_train) / 60, package_ok()))
+    done = stages_done()
+    if not SMOKE and set("ABCD") <= done:
+        print("all stages finished (exit %s) but the package is incomplete: the export cell re-exports" % rc)
+    elif not SMOKE and wall_left() < 2100:
+        print("torchrun exit %s; %.0fs of wall time left: skipping the fallback training" % (rc, wall_left()))
+    else:
+        if not SMOKE and N_GPU > 1:
+            msg = "torchrun did not produce a package (exit %s, stages done %s); single-process fallback for %.2fh"
+            print(msg % (rc, sorted(done), h))
+        limit = min(h * 3600 + 1200, wall_left() - 1500) if not SMOKE else h * 3600 + 1800
+        rc = run_cmd([sys.executable, "-m", "arcjepa.training.train_all", "--hours", "%.4f" % h] + common,
+                     limit, LOG_PATH)
+print("training finished in %.1f min, package ok: %s, complete: %s" % (
+    (time.time() - t_train) / 60, package_ok(), package_complete()))
 '''
 
 TRAIN_EXPORT_SRC = r'''
-# ---- make sure the offline package exists (export from the last checkpoint otherwise)
+# ---- make sure a complete offline package exists: re-export from the last checkpoint otherwise, on CUDA when
+# present and with a reduced memory (the full 20k-task memory cannot be rebuilt inside this cell's time box;
+# on CPU the v1 model needs ~9 s per memory task, so the CPU path keeps only a token synthetic memory)
 ckpt = os.path.join(RUN_DIR, "checkpoints", "last.pt")
-if not package_ok() and os.path.isfile(ckpt):
-    run_cmd([sys.executable, "-m", "arcjepa.training.export", "--checkpoint", ckpt, "--out", PKG_DIR,
-             "--config", CONFIG, "--set", "synthetic.path=" + SYNTH_PATH], 3600, LOG_PATH)
+if not package_complete() and os.path.isfile(ckpt):
+    export_cmd = [sys.executable, "-m", "arcjepa.training.export", "--checkpoint", ckpt, "--out", PKG_DIR,
+                  "--config", CONFIG, "--device", "auto", "--set", "synthetic.path=" + SYNTH_PATH,
+                  "--set", "synthetic.n_tasks=%d" % N_SYNTH]
+    if EPISODES_ROOT:
+        export_cmd += ["--set", "data.root=" + EPISODES_ROOT]
+    if not SMOKE:
+        if N_GPU > 0:
+            export_cmd += ["--set", "memory.max_synthetic=4000", "--set", "memory.pseudo_label_seconds=0"]
+        else:
+            export_cmd += ["--set", "memory.max_synthetic=64", "--set", "memory.include_real=false",
+                           "--set", "memory.pseudo_label_seconds=0"]
+    limit = 3600 if SMOKE else max(60.0, min(2400.0, wall_left() - 300))
+    run_cmd(export_cmd, limit, LOG_PATH)
+print("package ok: %s, complete: %s" % (package_ok(), package_complete()))
 if package_ok():
     from arcjepa.model.arcjepa import ARCJEPA
 
@@ -356,8 +427,9 @@ for f in sorted(glob.glob(os.path.join(PKG_DIR, "*"))):
 
 TRAIN_SUMMARY_SRC = r'''
 # ---- summary
-report = {"smoke": SMOKE, "package_ok": package_ok(), "package_dir": PKG_DIR, "synthetic_tasks": N_SYNTH,
-          "minutes": round((time.time() - T0) / 60, 1), "config": CONFIG}
+report = {"smoke": SMOKE, "package_ok": package_ok(), "package_complete": package_complete(),
+          "package_dir": PKG_DIR, "synthetic_tasks": N_SYNTH, "minutes": round((time.time() - T0) / 60, 1),
+          "train_hours": TRAIN_HOURS, "wall_hours": WALL_HOURS, "config": CONFIG}
 summary_path = os.path.join(RUN_DIR, "train_summary.json")
 if os.path.isfile(summary_path):
     with open(summary_path, encoding="utf-8") as fh:
@@ -384,11 +456,29 @@ if not package_ok():
 '''
 
 
-def build_train_notebook() -> Dict[str, Any]:
-    """The training notebook as nbformat JSON."""
+#: baked-in defaults per build mode (Kaggle kernels cannot set environment variables). FULL: the v1 model on
+#: 4 x L4 with torchrun; TRAIN_HOURS 7.5 from the notebook start (synthetic <= 0.5 h, stages + export inside
+#: train_all's --hours), wall cap 8.5 h for every step including the fallbacks (12 h Kaggle limit, quota headroom).
+BUILD_MODES: Dict[str, Dict[str, str]] = {
+    "smoke": {"__MODE__": "smoke (debug config)", "__SMOKE_DEFAULT__": "1", "__TRAIN_HOURS_DEFAULT__": "9.5"},
+    "full": {"__MODE__": "FULL (v1 model, configs/kaggle.yaml)", "__SMOKE_DEFAULT__": "0",
+             "__TRAIN_HOURS_DEFAULT__": "7.5"},
+}
+FULL_KERNEL_DIR = "train_full"
+
+
+def _bake(src: str, mode: str) -> str:
+    for key, val in BUILD_MODES[mode].items():
+        src = src.replace(key, val)
+    return src
+
+
+def build_train_notebook(full: bool = False) -> Dict[str, Any]:
+    """The training notebook as nbformat JSON (``full``: FULL-mode defaults baked in, else smoke)."""
+    mode = "full" if full else "smoke"
     return notebook([
-        markdown_cell("train-00-header", TRAIN_HEADER),
-        code_cell("train-01-setup", TRAIN_SETUP_SRC),
+        markdown_cell("train-00-header", _bake(TRAIN_HEADER, mode)),
+        code_cell("train-01-setup", _bake(TRAIN_SETUP_SRC, mode)),
         code_cell("train-02-code", CODE_SETUP_SRC),
         code_cell("train-03-run-cmd", RUN_CMD_SRC),
         code_cell("train-04-env", TRAIN_ENV_SRC),
@@ -399,15 +489,24 @@ def build_train_notebook() -> Dict[str, Any]:
     ])
 
 
-def build(out_dir: Optional[Path] = None) -> Dict[str, str]:
-    """Write ``<out_dir>/arc-jepa-train.ipynb``, ``<out_dir>/train/kernel-metadata.json`` and the notebook copy
-    ``<out_dir>/train/arc-jepa-train.ipynb``; returns the written paths."""
+def build(out_dir: Optional[Path] = None, full: bool = False) -> Dict[str, str]:
+    """Default (smoke): write ``<out_dir>/arc-jepa-train.ipynb``, ``<out_dir>/train/kernel-metadata.json`` and the
+    notebook copy ``<out_dir>/train/arc-jepa-train.ipynb``. ``full``: write the FULL-mode kernel folder
+    ``<out_dir>/train_full/`` (same kernel id and metadata, ARCJEPA_SMOKE default "0", ARCJEPA_TRAIN_HOURS default
+    "7.5"). Returns the written paths."""
     out = Path(out_dir) if out_dir else KAGGLE_DIR
+    meta = kernel_metadata(TRAIN_SLUG, TRAIN_TITLE, TRAIN_NOTEBOOK)
+    if full:
+        nb = build_train_notebook(full=True)
+        return {
+            "kernel_notebook": write_json(nb, out / FULL_KERNEL_DIR / TRAIN_NOTEBOOK),
+            "metadata": write_json(meta, out / FULL_KERNEL_DIR / "kernel-metadata.json"),
+        }
     nb = build_train_notebook()
     return {
         "notebook": write_json(nb, out / TRAIN_NOTEBOOK),
         "kernel_notebook": write_json(nb, out / "train" / TRAIN_NOTEBOOK),
-        "metadata": write_json(kernel_metadata(TRAIN_SLUG, TRAIN_TITLE, TRAIN_NOTEBOOK), out / "train" / "kernel-metadata.json"),
+        "metadata": write_json(meta, out / "train" / "kernel-metadata.json"),
     }
 
 
@@ -415,8 +514,10 @@ def main(argv: Optional[Sequence[str]] = None) -> Dict[str, str]:
     """CLI entry point."""
     ap = argparse.ArgumentParser(description="Build the ARC-JEPA Kaggle training notebook.")
     ap.add_argument("--out-dir", default=None, help="output folder (default: this kaggle/ folder)")
+    ap.add_argument("--full", action="store_true",
+                    help="write the FULL-mode kernel folder <out-dir>/train_full (ARCJEPA_SMOKE=0, 7.5 train hours)")
     a = ap.parse_args(argv)
-    return build(Path(a.out_dir) if a.out_dir else None)
+    return build(Path(a.out_dir) if a.out_dir else None, full=a.full)
 
 
 if __name__ == "__main__":

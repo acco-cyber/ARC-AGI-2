@@ -1,0 +1,131 @@
+{
+ "smoke": true,
+ "package_ok": true,
+ "package_dir": "/kaggle/working/arc_jepa_pkg",
+ "synthetic_tasks": 200,
+ "minutes": 0.8,
+ "config": "/kaggle/working/arc-jepa/configs/debug.yaml",
+ "train_summary": {
+  "out": "/kaggle/working/run",
+  "stages": {
+   "A": {
+    "stage": "A",
+    "steps": 20,
+    "steps_this_run": 20,
+    "total": 20,
+    "planned": 20,
+    "epochs_done": 0,
+    "seconds": 9.91,
+    "skipped": 0,
+    "stopped_on_time": false,
+    "retrieval@1": 0.0625,
+    "retrieval@8": 0.5,
+    "retrieval_n": 16.0,
+    "retrieval_programs": 16.0
+   },
+   "B": {
+    "stage": "B",
+    "steps": 20,
+    "steps_this_run": 20,
+    "total": 20,
+    "planned": 20,
+    "epochs_done": 0,
+    "seconds": 3.99,
+    "skipped": 0,
+    "stopped_on_time": false,
+    "val_loss_total": 2.5903035402297974,
+    "val_loss_g": 0.7421421855688095,
+    "val_loss_o": 1.2867206931114197,
+    "val_loss_r": 1.0627181231975555,
+    "val_loss_var": 0.6016310304403305,
+    "retrieval@1": 0.0625,
+    "retrieval@8": 0.5,
+    "retrieval_n": 16.0,
+    "retrieval_programs": 16.0
+   },
+   "C": {
+    "stage": "C",
+    "steps": 20,
+    "steps_this_run": 20,
+    "total": 20,
+    "planned": 20,
+    "epochs_done": 0,
+    "seconds": 4.58,
+    "skipped": 0,
+    "stopped_on_time": false,
+    "retrieval@1": 0.0625,
+    "retrieval@8": 0.5,
+    "retrieval_n": 16.0,
+    "retrieval_programs": 16.0
+   },
+   "D": {
+    "stage": "D",
+    "steps": 20,
+    "steps_this_run": 20,
+    "total": 20,
+    "planned": 20,
+    "epochs_done": 0,
+    "seconds": 4.72,
+    "skipped": 0,
+    "stopped_on_time": false,
+    "retrieval@1": 0.0625,
+    "retrieval@8": 0.5,
+    "retrieval_n": 16.0,
+    "retrieval_programs": 16.0
+   }
+  },
+  "completed": [
+   "A",
+   "B",
+   "C",
+   "D"
+  ],
+  "global_step": 80,
+  "n_params": 557041,
+  "package": {
+   "dir": "/kaggle/working/arc_jepa_pkg",
+   "files": [
+    "model.safetensors",
+    "config.json",
+    "vocab.json",
+    "program_memory.npz",
+    "programs.json"
+   ],
+   "memory_size": 28,
+   "seconds": 2.35
+  },
+  "seconds": 32.44
+ },
+ "n_metric_rows": 34,
+ "last_train": {
+  "kind": "train",
+  "stage": "D",
+  "step": 20,
+  "total": 20,
+  "epoch": 0,
+  "global_step": 80,
+  "lr": 1.7520162258957028e-06,
+  "grad_norm": 4.265958786010742,
+  "sec_per_step": 0.1714935779571533,
+  "skipped": 0,
+  "loss_total": 2.085206961631775,
+  "loss_g": 0.719435739517212,
+  "loss_o": 0.4843994140625,
+  "loss_r": 0.9335127711296082,
+  "loss_prog": 0.19598053097724916,
+  "loss_rank": 0.19239379167556764,
+  "loss_var": 0.524823009967804,
+  "collapse_std": 0.4815034449100494,
+  "wall": 28.114
+ },
+ "last_eval": {
+  "kind": "eval",
+  "stage": "D",
+  "global_step": 80,
+  "retrieval@1": 0.0625,
+  "retrieval@8": 0.5,
+  "retrieval_n": 16.0,
+  "retrieval_programs": 16.0,
+  "wall": 29.069
+ }
+}

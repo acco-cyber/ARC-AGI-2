@@ -18,10 +18,12 @@ arcjepa/data       HF loader, tensorization  kaggle/           train + inference
 tests/             pytest (CPU, < 60 s per module)
 ```
 
-## Honest status
-See `docs/RESULTS.md` (written after each measured run). Every number there is measured; the spec's accuracy
-gates are the spec's targets, not forecasts. For context: no published system of this model class has a
-verified hidden-set ARC-AGI-2 score above 27 %.
+## Honest status (2026-09-27)
+Measured: symbolic search (86 ops + induction), 60 s/task — **Hard-180 24/180 = 13.3 %**, Val-150 39/150 = 26.0 %
+(task-level pass@2). v1 smoke model: public eval 0.0083, Kaggle LB 0.00. No full-size model has been trained yet
+(GPU quota). Full log: `docs/SESSION_LOG.md`; step tracker for the v2 brief: `docs/V2_PROGRESS.md`. The spec's
+accuracy gates are targets, not forecasts; no published system of this model class has a verified hidden-set
+ARC-AGI-2 score above 27 %.
 
 ## Quick start
 ```bash

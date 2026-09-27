@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 from collections import OrderedDict
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, FrozenSet, List, Optional, Sequence
 
 import numpy as np
 import torch
@@ -43,6 +43,18 @@ class NeuralPrior:
         self.cache_size = int(cache_size)
         self._cache: "OrderedDict[str, float]" = OrderedDict()
         self.calls = 0
+        self._unseen: Optional[FrozenSet[str]] = None
+
+    @property
+    def unseen_ops(self) -> FrozenSet[str]:
+        """Registered DSL ops that the model's program tokenizer has no token for (they encode to ``<unk>``: a
+        package exported before the DSL spec extensions, INTERFACES.md §1a).  The model cannot rank them, so the
+        beam expands them regardless of the prior instead of letting an arbitrary ``<unk>`` score prune them."""
+        if self._unseen is None:
+            from arcjepa.dsl.primitives import REGISTRY
+            stoi = getattr(getattr(self.model, "tokenizer", None), "stoi", None)
+            self._unseen = frozenset(n for n in REGISTRY if n not in stoi) if isinstance(stoi, dict) else frozenset()
+        return self._unseen
 
     def with_rule(self, r_task: Tensor) -> "NeuralPrior":
         """A new prior for another rule latent (e.g. after test-time refinement)."""

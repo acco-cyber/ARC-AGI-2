@@ -303,6 +303,30 @@ def test_tokenizer_save_load(tmp_path: Path) -> None:
     assert tok2.itos == tok.itos and tok2.encode(PROGRAMS[0]) == tok.encode(PROGRAMS[0])
 
 
+def test_tokenizer_vocab_includes_the_dsl_spec_extensions(tmp_path: Path) -> None:
+    """The vocabulary is built from REGISTRY, so the spec extensions (INTERFACES.md §1) are real tokens that the
+    package's vocab.json saves; a vocabulary saved before them encodes them as <unk> without failing."""
+    prims = pytest.importorskip("arcjepa.dsl.primitives")
+    ext = prims.EXTENSION_PRIMITIVES
+    tok = ProgramTokenizer()
+    assert set(ext) <= set(tok.vocab) and set(ext) <= set(tok.op_names)
+    for src in ("(MIRROR_TILE (PANEL_BOOL INPUT 1 (MOST_COMMON_COLOR INPUT)))", "(UPSCALE (KRON_SELF INPUT) 2)",
+                "(DOWNSCALE_ANY (BBOX_FILL INPUT 3) 2)", "(PANEL_OVERLAY (CONNECT_SAME INPUT 0) 5)",
+                "(FILL_EMPTY_LINES (UPSCALE_NC (DOWNSCALE INPUT 3)) 4)"):
+        ids = tok.encode(src)
+        assert tok.UNK not in ids and tok.unk_lit_id not in ids, src
+        assert tok.decode(ids).to_str() == src
+    tok.save(tmp_path / "vocab.json")
+    assert set(ext) <= set(ProgramTokenizer.load(tmp_path / "vocab.json").itos)
+    old = ProgramTokenizer(registry={k: v for k, v in prims.REGISTRY.items() if not v.extension})
+    assert not set(ext) & set(old.vocab) and old.vocab_size == tok.vocab_size - len(ext)
+    old.save(tmp_path / "old_vocab.json")
+    loaded = ProgramTokenizer.load(tmp_path / "old_vocab.json")  # rebuilt with the new registry: saved order wins
+    assert loaded.itos == old.itos
+    ids = loaded.encode("(UPSCALE (ROTATE90 INPUT) 2)")
+    assert ids[1] == loaded.UNK and ids[4] == loaded.stoi["ROTATE90"]
+
+
 def test_program_encoder_and_scorer_shapes() -> None:
     torch.manual_seed(0)
     tok = ProgramTokenizer()

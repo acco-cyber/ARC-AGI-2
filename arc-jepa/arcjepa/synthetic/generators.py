@@ -19,7 +19,8 @@ from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from arcjepa.core.types import Grid, MAX_SIDE
 
-__all__ = ["STYLES", "STYLE_WEIGHTS", "random_input_grid", "random_palette", "random_size"]
+__all__ = ["STYLES", "STYLE_WEIGHTS", "SHAPE_HINTS", "random_input_grid", "random_palette", "random_size",
+           "shaped_input_grid"]
 
 STYLES: Tuple[str, ...] = ("objects", "lines", "tiles", "noise_sparse", "frames", "symmetric")
 #: Default style distribution used by the task sampler (object scenes dominate, as in ARC).
@@ -261,4 +262,102 @@ def random_input_grid(rng: random.Random, *, h: Optional[int] = None, w: Optiona
     painters[style]()
     if all(v == background for row in g for v in row):  # guarantee some foreground
         g[rng.randrange(h)][rng.randrange(w)] = rng.choice(pal)
+    return g
+
+
+# ======================================================================================= shaped inputs
+
+#: Input shapes required by the size- / structure-constrained spec extensions (see :func:`shaped_input_grid`).
+SHAPE_HINTS: Tuple[str, ...] = ("kron", "blocks", "blocks_any", "panels", "small")
+_SMALL_STYLES: Tuple[str, ...] = ("objects", "noise_sparse", "symmetric", "tiles")
+
+
+def _blocks(rng: random.Random, pal: List[int], background: int, k: int, any_mode: bool, style: str) -> Grid:
+    """A small grid upscaled by ``k`` with per-block noise: majority-preserving flips (``any_mode`` False) or
+    partially emptied non-background blocks (``any_mode`` True), so DOWNSCALE / DOWNSCALE_ANY recover it."""
+    side = max(2, 30 // k)
+    bh, bw = rng.randint(2, min(7, side)), rng.randint(2, min(7, side))
+    base = random_input_grid(rng, h=bh, w=bw, palette=pal, background=background,
+                             style=style if style in _SMALL_STYLES else "noise_sparse")
+    g: Grid = [[background] * (bw * k) for _ in range(bh * k)]
+    minority = (k * k - 1) // 2  # cells a block may change and keep its majority
+    for r in range(bh):
+        for c in range(bw):
+            v = base[r][c]
+            cells = [(r * k + i, c * k + j) for i in range(k) for j in range(k)]
+            for rr, cc in cells:
+                g[rr][cc] = v
+            if any_mode:
+                if v != background and rng.random() < 0.7:
+                    keep = rng.randint(1, k * k - 1)
+                    for rr, cc in rng.sample(cells, k * k - keep):
+                        g[rr][cc] = background
+            elif minority and rng.random() < 0.35:
+                for rr, cc in rng.sample(cells, rng.randint(1, minority)):
+                    g[rr][cc] = rng.choice([x for x in pal + [background] if x != v] or [v])
+    return g
+
+
+def _panels(rng: random.Random, pal: List[int], background: int, style: str, min_panels: int = 2) -> Grid:
+    """2-4 (at least ``min_panels``) equally shaped random panels side by side (or stacked), joined by separator
+    lines of one colour that is not used inside the panels (no separator for 2 panels, 30 % of the time: the halves
+    split)."""
+    n = rng.choice([x for x in (2, 2, 2, 3, 4) if x >= min_panels] or [4])
+    vertical = rng.random() < 0.5  # panels side by side
+    ph, pw = rng.randint(3, 6), rng.randint(3, 6)
+    sep_free = [c for c in range(1, 10) if c != background and c not in pal]
+    use_sep = bool(sep_free) and not (n == 2 and rng.random() < 0.3)
+    panel_style = style if style in ("objects", "noise_sparse", "symmetric") else "noise_sparse"
+    ps = [random_input_grid(rng, h=ph, w=pw, palette=pal, background=background, style=panel_style)
+          for _ in range(n)]
+    if not use_sep and n == 2:  # the halves rule splits left / right only when W >= 2H - 1
+        vertical = 2 * pw >= 2 * ph - 1
+    sep = rng.choice(sep_free) if use_sep else None
+    if vertical:
+        rows: Grid = [[] for _ in range(ph)]
+        for i, p in enumerate(ps):
+            for r in range(ph):
+                if i and sep is not None:
+                    rows[r].append(sep)
+                rows[r].extend(p[r])
+        return rows
+    out: Grid = []
+    for i, p in enumerate(ps):
+        if i and sep is not None:
+            out.append([sep] * pw)
+        out.extend(list(row) for row in p)
+    return out
+
+
+def shaped_input_grid(rng: random.Random, hint: str, *, palette: Optional[Sequence[int]] = None,
+                      background: int = 0, style: str = "objects", k: Optional[int] = None) -> Grid:
+    """Random input grid shaped for a structure- or size-constrained spec extension.
+
+    ``hint`` (one of :data:`SHAPE_HINTS`): ``kron`` -- sides 2..5 (KRON_SELF squares the sides); ``blocks`` /
+    ``blocks_any`` -- a small grid upscaled by ``k`` (default 2 or 3) with block noise that DOWNSCALE /
+    DOWNSCALE_ANY undo; ``panels`` -- 2-4 equal panels (at least ``k`` when given) joined by separator lines
+    (PANEL_BOOL / PANEL_OVERLAY); ``small`` -- sides <= 30 // ``k`` (UPSCALE by ``k``, default 3).  Every result is
+    a valid grid with some non-background cell.
+    """
+    if hint not in SHAPE_HINTS:
+        raise ValueError(f"unknown shape hint {hint!r}; expected one of {SHAPE_HINTS}")
+    pal = [c for c in (palette if palette is not None else random_palette(rng, background)) if c != background]
+    if not pal:
+        pal = random_palette(rng, background, k=1)
+    small_style = style if style in _SMALL_STYLES else "objects"
+    if hint == "kron":
+        g = random_input_grid(rng, h=rng.randint(2, 5), w=rng.randint(2, 5), palette=pal, background=background,
+                              style=small_style)
+    elif hint in ("blocks", "blocks_any"):
+        kk = k if k is not None and 2 <= k <= 5 else rng.choice((2, 3))
+        g = _blocks(rng, pal, background, kk, hint == "blocks_any", style)
+    elif hint == "panels":
+        g = _panels(rng, pal, background, style, min_panels=k if k is not None else 2)
+    else:
+        kk = k if k is not None and k >= 1 else 3
+        side = max(1, min(10, MAX_SIDE // kk))
+        g = random_input_grid(rng, h=rng.randint(min(2, side), side), w=rng.randint(min(2, side), side),
+                              palette=pal, background=background, style=small_style)
+    if all(v == background for row in g for v in row):
+        g[rng.randrange(len(g))][rng.randrange(len(g[0]))] = rng.choice(pal)
     return g

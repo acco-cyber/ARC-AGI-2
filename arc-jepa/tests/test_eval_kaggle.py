@@ -1,10 +1,12 @@
 """Tests for arcjepa/eval, kaggle/ (notebook builders, submission validator) and the Kaggle submission runner."""
 from __future__ import annotations
 
+import ast
 import importlib.util
 import json
 import os
 import py_compile
+import re
 import subprocess
 import sys
 import time
@@ -239,16 +241,129 @@ def test_validate_file_and_cli(tmp_path: Path) -> None:
 def test_fallbacks_and_repair() -> None:
     fb = VS.fallback_submission(CHALLENGES)
     assert VS.validate_submission(fb, CHALLENGES) == []
-    assert fb["t1"][0]["attempt_1"] == B                     # identity
-    assert fb["t2"][1]["attempt_2"] == [[5, 5, 5]]           # most common demo output shape + colour
+    # t1 is not an identity task: no attempt is the test input; both are 2x2 fills (the predicted shape) with the
+    # two most common demo output colours
+    t1 = fb["t1"][0]
+    assert B not in (t1["attempt_1"], t1["attempt_2"]) and t1["attempt_1"] != t1["attempt_2"]
+    assert all(len({v for r in g for v in r}) == 1 and (len(g), len(g[0])) == (2, 2) for g in t1.values())
+    assert fb["t2"][0]["attempt_1"] == [[5, 5, 5]] and fb["t2"][1]["attempt_1"] == [[5, 5, 5]]  # constant output
+    assert fb["t2"][1]["attempt_2"] == [[7]]                 # identity only as the last resort
     assert {t: fallback_attempts(d) for t, d in CHALLENGES.items()} == fb  # runner and inline agree
+    ident_task = {"train": [{"input": A, "output": A}, {"input": B, "output": B}], "test": [{"input": [[7]]}]}
+    assert VS.fallback_attempts(ident_task)[0]["attempt_1"] == [[7]] == fallback_attempts(ident_task)[0]["attempt_1"]
     rep = VS.repair_submission(_mutate("value_10"), CHALLENGES)
     assert VS.validate_submission(rep, CHALLENGES) == []
-    assert rep["t1"][0]["attempt_1"] == B and rep["t1"][0]["attempt_2"] == A
+    assert rep["t1"][0]["attempt_1"] == fb["t1"][0]["attempt_1"] and rep["t1"][0]["attempt_2"] == A
     assert VS.validate_submission(VS.repair_submission(None, CHALLENGES), CHALLENGES) == []
 
 
+def test_fallbacks_agree_with_the_solver_and_avoid_the_identity() -> None:
+    """runner / inline / arcjepa.search fallbacks give the same two grids on real tasks, and never the identity
+    for a task whose demos are not all identity mappings."""
+    from arcjepa.core.types import task_from_json
+    from arcjepa.search import fallback_grids
+
+    path = Path(os.environ.get("ARCJEPA_DATA", r"E:\Claude code\arc2\dataset\hf_arc2_episodes")) / "tasks" / "train.jsonl"
+    if not path.is_file():
+        pytest.skip(f"real task file missing: {path}")
+    rows = []
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            if len(rows) >= 60:
+                break
+            rows.append(json.loads(line))
+    n_identity_tasks = 0
+    for row in rows:
+        ch = {"train": row["train"], "test": [{"input": p["input"]} for p in row["test"]]}
+        fa, fv = fallback_attempts(ch), VS.fallback_attempts(ch)
+        assert fa == fv, row["task_id"]
+        task = task_from_json(row["task_id"], row)
+        pairs = [p for p in task.train]
+        ident = all(p.input == p.output for p in pairs)
+        n_identity_tasks += ident
+        for tp, att in zip(task.test, fa):
+            fbs = fallback_grids(tp.input, pairs)
+            first_two = [fbs[0], next((g for g in fbs[1:] if g != fbs[0]), fbs[0])]
+            assert first_two == [att["attempt_1"], att["attempt_2"]], row["task_id"]
+            if not ident:
+                assert tp.input not in first_two, row["task_id"]
+    assert n_identity_tasks < len(rows)
+
+
+def _pkg(d: Path, *, debug: bool = False, created: int = 1_790_000_000, fmt: str = "arcjepa-package-v1",
+         weights: bytes = b"\x08\x00\x00\x00\x00\x00\x00\x00{}      ", config: Any = None) -> Path:
+    d.mkdir(parents=True, exist_ok=True)
+    cfg = config if config is not None else json.dumps({
+        "format": fmt, "created_unix": created, "n_parameters": 557041 if debug else 39_530_000,
+        "training": {"config_path": "configs/debug.yaml" if debug else "configs/kaggle.yaml"}})
+    (d / "config.json").write_text(cfg, encoding="utf-8")
+    (d / "model.safetensors").write_bytes(weights)
+    return d
+
+
+def test_find_package_kaggle_mount_layouts(tmp_path: Path) -> None:
+    from arcjepa.utils.kaggle_submit_runner import find_package, package_info
+
+    def fresh(name: str) -> Path:
+        root = tmp_path / name / "input"
+        root.mkdir(parents=True)
+        return root
+
+    def code_dataset(root: Path) -> None:  # the code dataset with its local runs/ debug packages (decoys)
+        (root / "arc-jepa-code" / "arcjepa").mkdir(parents=True)
+        (root / "arc-jepa-code" / "arcjepa" / "__init__.py").write_text("", encoding="utf-8")
+        _pkg(root / "arc-jepa-code" / "runs" / "e2e" / "pkg", debug=True)
+        _pkg(root / "arc-jepa-code" / "runs" / "fake" / "arc-jepa-train" / "arc_jepa_pkg", debug=True)
+
+    layouts = {
+        "new": "notebooks/poby7722/arc-jepa-train/arc_jepa_pkg",
+        "old": "arc-jepa-train/arc_jepa_pkg",
+        "nested_output": "notebooks/poby7722/arc-jepa-train/output/arc_jepa_pkg",
+        "versioned": "notebooks/poby7722/arc-jepa-train/versions/3/arc_jepa_pkg",
+    }
+    for name, rel in layouts.items():
+        root = fresh(name)
+        code_dataset(root)
+        want = _pkg(root / rel)
+        assert find_package([], search_roots=[str(root)]) == str(want), name
+    # decoys only: nothing is picked (a code tree is never searched)
+    root = fresh("decoy_only")
+    code_dataset(root)
+    assert find_package([], search_roots=[str(root)]) is None
+    # a smoke-trained kernel output is still found (the notebook's dev gate flags it), after any real package
+    root = fresh("debug_vs_real")
+    smoke = _pkg(root / "arc-jepa-train-smoke" / "arc_jepa_pkg", debug=True)
+    assert find_package([], search_roots=[str(root)]) == str(smoke) and package_info(str(smoke))["debug"]
+    real = _pkg(root / "arc-jepa-train" / "arc_jepa_pkg")
+    assert find_package([], search_roots=[str(root)]) == str(real)
+    # newest real package first; broken ones are skipped
+    root = fresh("versions")
+    _pkg(root / "a" / "arc_jepa_pkg", created=100)
+    newest = _pkg(root / "b" / "arc_jepa_pkg", created=200)
+    _pkg(root / "c" / "arc_jepa_pkg", created=300, config="{not json")
+    _pkg(root / "d" / "arc_jepa_pkg", created=400, weights=b"")
+    _pkg(root / "e" / "arc_jepa_pkg", created=500, fmt="something-else")
+    assert find_package([], search_roots=[str(root)]) == str(newest)
+    # generic (not arc_jepa_pkg-named) folders: real ones up to max_depth, debug ones only with allow_debug
+    root = fresh("generic")
+    dbg = _pkg(root / "some-output" / "pkg", debug=True)
+    assert find_package([], search_roots=[str(root)]) is None
+    assert find_package([], search_roots=[str(root)], allow_debug=True) == str(dbg)
+    gen = _pkg(root / "other-output" / "model_pkg")
+    assert find_package([], search_roots=[str(root)]) == str(gen)
+    # explicit candidates win, debug or not; invalid explicit candidates fall through to the walk
+    assert find_package([str(dbg)], search_roots=[str(root)]) == str(dbg)
+    assert find_package([str(tmp_path / "missing"), str(root)], search_roots=[str(root)]) == str(gen)
+    assert find_package([], search_roots=[str(tmp_path / "nowhere")]) is None
+
+
 # ============================================================================================ notebooks
+
+def _statement_first_lines(src: str) -> List[str]:
+    """First source line of every statement (continuation lines of a multi-line expression excluded)."""
+    lines = src.splitlines()
+    return [lines[n.lineno - 1] for n in ast.walk(ast.parse(src)) if isinstance(n, ast.stmt)]
+
 
 def _check_notebook(path: Path, tmp_path: Path) -> Dict[str, Any]:
     nbformat = pytest.importorskip("nbformat")
@@ -259,11 +374,17 @@ def _check_notebook(path: Path, tmp_path: Path) -> Dict[str, Any]:
     for c in nb.cells:
         if c.cell_type != "code":
             continue
-        assert not any(line.lstrip().startswith(("!", "%")) for line in c.source.splitlines())
         f = tmp_path / f"{path.stem}-{c['id']}.py"
         f.write_text(c.source, encoding="utf-8")
-        py_compile.compile(str(f), cfile=str(f) + "c", doraise=True)
+        py_compile.compile(str(f), cfile=str(f) + "c", doraise=True)  # a `%magic` / `!cmd` line cannot compile
+        # no IPython magic / shell escape at the start of any statement (a line starting with "%" inside a
+        # multi-line expression, e.g. `"..." % (a, b)`, is ordinary Python)
+        assert not any(line.lstrip().startswith(("!", "%")) for line in _statement_first_lines(c.source)), c["id"]
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _cell_sources(nb: Dict[str, Any]) -> List[str]:
+    return ["".join(c["source"]) for c in nb["cells"]]
 
 
 def test_notebooks_build_validate_and_compile(tmp_path: Path) -> None:
@@ -277,8 +398,11 @@ def test_notebooks_build_validate_and_compile(tmp_path: Path) -> None:
     for m in (mt, mi):
         assert m["docker_image"] == DOCKER and m["machine_shape"] == "NvidiaL4"
         assert m["enable_internet"] is False and m["enable_gpu"] is True
-        assert m["competition_sources"] == ["arc-prize-2026-arc-agi-2"]
         assert m["dataset_sources"] == ["poby7722/arc-jepa-code", "poby7722/arc-agi-2-jepa-episodes"]
+    # the inference kernel needs the competition data; the training kernel reads no ARC competition file, so it
+    # may drop the mount (review 09-26)
+    assert mi["competition_sources"] == ["arc-prize-2026-arc-agi-2"]
+    assert mt["competition_sources"] in ([], ["arc-prize-2026-arc-agi-2"])
     assert mt["id"] == "poby7722/arc-jepa-train" and mt["code_file"] == "arc-jepa-train.ipynb"
     assert mt["kernel_sources"] == []
     assert mi["id"] == "poby7722/arc-jepa-infer" and mi["code_file"] == "arc-jepa-infer.ipynb"
@@ -288,12 +412,33 @@ def test_notebooks_build_validate_and_compile(tmp_path: Path) -> None:
                 "arc-jepa-infer.ipynb", "infer/kernel-metadata.json", "infer/arc-jepa-infer.ipynb"):
         assert (KAGGLE / rel).is_file(), rel
         assert (KAGGLE / rel).read_bytes() == (out / rel).read_bytes(), f"{rel} is stale: rerun the builders"
-    src = "".join(json.loads((out / "arc-jepa-train.ipynb").read_text(encoding="utf-8"))["cells"][5]["source"])
-    assert "arcjepa.synthetic.dataset" in src
-    isrc = json.dumps(json.loads((out / "arc-jepa-infer.ipynb").read_text(encoding="utf-8")))
+    train_srcs = _cell_sources(json.loads((out / "arc-jepa-train.ipynb").read_text(encoding="utf-8")))
+    assert any("arcjepa.synthetic.dataset" in s for s in train_srcs)
+    # smoke stays the default build; --full writes kaggle/train_full with FULL defaults and identical metadata
+    assert any('os.environ.get("ARCJEPA_SMOKE", "1")' in s for s in train_srcs)
+    full = BT.build(out, full=True)
+    fsrcs = _cell_sources(_check_notebook(Path(full["kernel_notebook"]), tmp_path))
+    assert any('os.environ.get("ARCJEPA_SMOKE", "0")' in s for s in fsrcs)
+    assert any('os.environ.get("ARCJEPA_TRAIN_HOURS", "7.5")' in s for s in fsrcs)
+    assert any("WALL_HOURS" in s for s in fsrcs)
+    assert not re.findall(r"__[A-Z][A-Z0-9_]*__", "".join(fsrcs)), "unsubstituted build placeholder"
+    assert json.loads(Path(full["metadata"]).read_text(encoding="utf-8")) == mt
+    assert any('"--device", "auto"' in s and "memory.max_synthetic=4000" in s for s in fsrcs)
+    for rel in ("train_full/kernel-metadata.json", "train_full/arc-jepa-train.ipynb"):
+        assert (KAGGLE / rel).read_bytes() == (out / rel).read_bytes(), f"{rel} is stale: rerun build_train_nb --full"
+    inb = json.loads((out / "arc-jepa-infer.ipynb").read_text(encoding="utf-8"))
+    isrc = json.dumps(inb)
     for needle in ("KAGGLE_IS_COMPETITION_RERUN", "arc-agi_test_challenges.json", "fallback_submission",
-                   "validate_submission", "run_submission", "arc-agi_evaluation_challenges.json"):
+                   "validate_submission", "run_submission", "arc-agi_evaluation_challenges.json",
+                   "notebooks/poby7722/arc-jepa-train/arc_jepa_pkg", "arc-jepa-train/arc_jepa_pkg"):
         assert needle in isrc, needle
+    # the dev gate is the last cell and never fires in a competition rerun
+    gate = inb["cells"][-1]
+    assert gate["id"] == "infer-09-dev-gate"
+    assert "if not IS_RERUN:" in "".join(gate["source"]) and "raise RuntimeError" in "".join(gate["source"])
+    # the code copy after the fallback submission is wrapped (a copy error must not fail a rerun)
+    code = next(s for c, s in zip(inb["cells"], _cell_sources(inb)) if c["id"] == "infer-04-code")
+    assert "copytree" in code and "except Exception as exc" in code
 
 
 # ============================================================================================ runner
@@ -347,13 +492,48 @@ def test_run_submission_deadline_keeps_fallbacks(tmp_path: Path) -> None:
 
 def test_run_submission_process_pool(tmp_path: Path) -> None:
     out = tmp_path / "submission.json"
-    cfg = RunnerConfig(total_seconds=25.0, reserve_seconds=0.5, min_task_seconds=0.5, max_task_seconds=2.0,
+    # per-task budgets are capped at 2 s; the global deadline only has to cover spawning the pool, which takes
+    # 10-20 s when every core is busy (the run returns as soon as the three tasks are done)
+    cfg = RunnerConfig(total_seconds=90.0, reserve_seconds=0.5, min_task_seconds=0.5, max_task_seconds=2.0,
                        workers=2, devices=["cpu"], threads_per_worker=1, rewrite_every_s=1.0, poll_s=0.2)
     summary = run_submission(RUN_CH, str(out), cfg=cfg)
     sub = json.loads(out.read_text(encoding="utf-8"))
     assert VS.validate_submission(sub, RUN_CH) == []
     assert summary["n_solved"] == 3, summary
     assert len({d.get("pid") for d in summary["diagnostics"].values()} - {os.getpid()}) >= 1
+    assert summary["pool_restarts"] == 0 and summary["quarantined"] == []
+    assert summary["model_loaded"] is False and summary["model_loaded_fraction"] == 0.0  # no package: symbolic
+
+
+class _KillOnUnpickle:
+    """Unpickling this object terminates the process that unpickles it: a stand-in for a worker that is
+    OOM-killed / segfaults on one task (the parent only pickles it)."""
+
+    def __reduce__(self) -> Any:
+        return (os._exit, (3,))
+
+
+def test_run_submission_requeues_after_worker_crash(tmp_path: Path) -> None:
+    ch: Dict[str, Any] = {f"f{i}": _flip_task([[i, (i + 1) % 10, (i + 2) % 10]]) for i in range(5)}
+    poison = _flip_task([[1, 2], [3, 4]])
+    poison["poison"] = _KillOnUnpickle()  # kills whichever worker receives this task, every time
+    ch["p"] = poison
+    out = tmp_path / "submission.json"
+    cfg = RunnerConfig(total_seconds=150.0, reserve_seconds=0.5, min_task_seconds=0.5, max_task_seconds=1.0,
+                       workers=2, devices=["cpu"], threads_per_worker=1, rewrite_every_s=1.0, poll_s=0.1)
+    t0 = time.time()
+    summary = run_submission(ch, str(out), cfg=cfg)
+    assert time.time() - t0 < 150.0
+    sub = json.loads(out.read_text(encoding="utf-8"))
+    assert VS.validate_submission(sub, ch) == []
+    # the crashing task is quarantined after its second crash (it ran alone as the only suspect); every task that
+    # was in flight with it was re-queued into a fresh pool and solved
+    assert summary["quarantined"] == ["p"] and summary["pool_restarts"] == 2, summary
+    assert "quarantined" in summary["diagnostics"]["p"]["error"]
+    assert summary["n_solved"] == 5 and summary["n_timeout"] == 0 and not summary.get("unstarted")
+    assert sub["p"] == fallback_attempts(poison)
+    sols = {f"f{i}": [flip(ch[f"f{i}"]["test"][0]["input"])] for i in range(5)}
+    assert VS.score_submission(sub, sols) == pytest.approx(1.0)
 
 
 # ============================================================================================ notebook end to end
@@ -374,15 +554,23 @@ def _run_infer(tmp_path: Path, mode: str, extra_env: Dict[str, str]) -> subproce
     work = tmp_path / f"work_{mode}"
     script = _notebook_script(KAGGLE / "arc-jepa-infer.ipynb", tmp_path / f"infer_{mode}.py")
     env = {k: v for k, v in os.environ.items() if k not in ("KAGGLE_IS_COMPETITION_RERUN", "ARCJEPA_PKG")}
+    # one torch thread, as the Kaggle pool workers pin theirs: with every core busy, torch's default pool of one
+    # thread per core stalls the CPU model stage of the debug package past the 2 s task budget
     env.update({"ARCJEPA_WORK": str(work), "ARCJEPA_COMP_DIR": str(comp), "ARCJEPA_CODE": str(ROOT),
-                "ARCJEPA_WORKERS": "0", "ARCJEPA_MAX_TASK_SECONDS": "2"})
+                "ARCJEPA_WORKERS": "0", "ARCJEPA_MAX_TASK_SECONDS": "2", "ARCJEPA_THREADS": "1"})
     env.update(extra_env)
     return subprocess.run([sys.executable, str(script)], env=env, capture_output=True, text=True, timeout=120,
                           cwd=str(tmp_path))
 
 
+#: Global / dev budgets of the notebook end-to-end runs. Per-task budgets are capped at 2 s
+#: (ARCJEPA_MAX_TASK_SECONDS) and the runs return as soon as the 3 tasks are done, so this is only a safety deadline
+#: that must also cover the notebook start (code copy + imports: 10-20 s when every core is busy).
+E2E_HOURS = "0.03"
+
+
 def test_infer_notebook_rerun_mode_end_to_end(tmp_path: Path) -> None:
-    r = _run_infer(tmp_path, "rerun", {"KAGGLE_IS_COMPETITION_RERUN": "1", "ARCJEPA_GLOBAL_HOURS": "0.0025"})
+    r = _run_infer(tmp_path, "rerun", {"KAGGLE_IS_COMPETITION_RERUN": "1", "ARCJEPA_GLOBAL_HOURS": E2E_HOURS})
     assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-3000:]
     sub = json.loads((tmp_path / "work_rerun" / "submission.json").read_text(encoding="utf-8"))
     assert VS.validate_submission(sub, RUN_CH) == []
@@ -393,14 +581,41 @@ def test_infer_notebook_rerun_mode_end_to_end(tmp_path: Path) -> None:
 
 
 def test_infer_notebook_dev_mode_end_to_end(tmp_path: Path) -> None:
-    extra = {"ARCJEPA_DEV_HOURS": "0.0025"}
+    extra = {"ARCJEPA_DEV_HOURS": E2E_HOURS}
     pkg = ROOT / "runs" / "debug" / "package"
     if (pkg / "config.json").is_file():
         extra["ARCJEPA_PKG"] = str(pkg)  # exercise the neural path with the debug package when it exists
+        extra["ARCJEPA_ALLOW_DEBUG_PKG"] = "1"  # the gate would (rightly) reject a debug package on Kaggle
+    else:
+        extra["ARCJEPA_ALLOW_SYMBOLIC"] = "1"
     r = _run_infer(tmp_path, "dev", extra)
     assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-3000:]
     assert "COMPETITION METRIC" in r.stdout and "valid = True" in r.stdout
+    if "ARCJEPA_PKG" in extra:
+        assert "dev gate passed" in r.stdout, r.stdout[-3000:]
     sub = json.loads((tmp_path / "work_dev" / "submission.json").read_text(encoding="utf-8"))
     assert VS.validate_submission(sub, RUN_CH) == []
     diag = json.loads((tmp_path / "work_dev" / "dev_eval_diagnostics.json").read_text(encoding="utf-8"))
     assert len(diag["tasks"]) == 3 and diag["summary"]["score"] == pytest.approx(1.0)
+
+
+def test_infer_notebook_dev_gate_fails_a_broken_commit(tmp_path: Path) -> None:
+    """Dev/commit mode with the code dataset missing must fail loudly (not save a fallback-only version)."""
+    r = _run_infer(tmp_path, "dev", {"ARCJEPA_DEV_HOURS": E2E_HOURS, "ARCJEPA_CODE": str(tmp_path / "no_code")})
+    assert r.returncode != 0, r.stdout[-3000:]
+    assert "DEV GATE FAILED" in r.stderr and "code dataset" in r.stderr, r.stderr[-3000:]
+    sub = json.loads((tmp_path / "work_dev" / "submission.json").read_text(encoding="utf-8"))
+    assert VS.validate_submission(sub, RUN_CH) == []  # the fallback file was still written first
+    # a missing package fails the gate too
+    r = _run_infer(tmp_path, "dev", {"ARCJEPA_DEV_HOURS": E2E_HOURS, "ARCJEPA_PKG": str(tmp_path / "no_pkg")})
+    assert r.returncode != 0 and "no trained package" in r.stderr, r.stdout[-2000:] + r.stderr[-2000:]
+
+
+def test_infer_notebook_rerun_never_fails_without_code(tmp_path: Path) -> None:
+    """Competition rerun with the code dataset missing: no gate, the fallback submission stands and is valid."""
+    r = _run_infer(tmp_path, "rerun", {"KAGGLE_IS_COMPETITION_RERUN": "1", "ARCJEPA_GLOBAL_HOURS": E2E_HOURS,
+                                       "ARCJEPA_CODE": str(tmp_path / "no_code")})
+    assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-3000:]
+    assert "the fallback submission stands" in r.stdout and "valid = True" in r.stdout
+    sub = json.loads((tmp_path / "work_rerun" / "submission.json").read_text(encoding="utf-8"))
+    assert sub == VS.fallback_submission(RUN_CH)

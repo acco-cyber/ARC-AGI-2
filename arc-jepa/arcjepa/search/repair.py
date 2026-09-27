@@ -37,7 +37,7 @@ from arcjepa.dsl.types import LITERAL_TYPES, Object, T
 from .beam import ArgPool, task_palette
 from .candidate import (ALPHA, BETA, GAMMA, Candidate, Prior, apply_prior, canonical_key, dedup_candidates,
                         demo_loss, make_candidate, sort_candidates)
-from .verifier import execute_safe, total_cells
+from .verifier import clipped_timeout, execute_safe, total_cells
 
 __all__ = ["repair", "localise", "local_edits", "diff_hints"]
 
@@ -120,7 +120,7 @@ def localise(prog: Node, pairs: Sequence[Pair], *, timeout_s: float = 0.05) -> L
                 vals.append(None)
                 continue
             try:
-                vals.append(evaluate(node, p.input, timeout_s=timeout_s))  # type: ignore[arg-type]
+                vals.append(evaluate(node, p.input, timeout_s=clipped_timeout(timeout_s)))  # type: ignore[arg-type]
             except ExecError:
                 vals.append(None)
         values[path] = vals
@@ -334,7 +334,9 @@ def repair(cands: Sequence[Candidate], pairs: Sequence[Pair], rounds: int = 1, r
         if found_exact and stop_on_exact:
             break
         work = sort_candidates(improved)[:max_repair]
-    if prior is not None:
-        results = apply_prior(results, prior, alpha, beta, gamma)
+    if prior is not None:  # s_neural for the NEW candidates only (the inputs keep their scores: no re-scoring of
+        new = results[len(cands):]  # the whole beam, which costs a large un-interruptible forward pass)
+        if new:
+            results = list(cands) + apply_prior(new, prior, alpha, beta, gamma)
     st["repair_seconds"] = time.perf_counter() - t0
     return dedup_candidates(results)

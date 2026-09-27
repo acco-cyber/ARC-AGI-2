@@ -63,6 +63,67 @@ def task_from_json(task_id, d) -> Task; def episode_from_json(d) -> Episode
   identity on 500 random programs; canonicalize(ROTATE90∘ROTATE90) == ROTATE180; enumerate_programs(2, 2000)
   yields ≥ 500 distinct canonical programs; 10 hand-written ARC-like programs reproduce expected outputs.
 
+### 1a. Spec extensions (v2, added 2026-09-27; binding)
+Ten generic grid ops that the val-150 solve-rate audit (`docs/SOLVE_RATE_AUDIT.md`, additions 1, 3, 4, 5) showed
+missing. They are registered in `primitives.py` with `extension=True` and are **outside the 72**:
+`SPEC_PRIMITIVES` stays exactly the 72 spec names (asserted at import), `STRUCTURAL_PRIMITIVES` = RENDER,
+RENDER_OBJ, RENDER_BLANK, CROP, `EXTENSION_PRIMITIVES` = the ten below; `len(REGISTRY) == 86`. Unlike the structural
+helpers they are ordinary typed search primitives: `expansions`, `random_program`, `enumerate_programs`,
+`mutate` / `hard_negatives`, the beam templates, the synthetic sampler and `ProgramTokenizer` all see them. Every one
+is `GRID × literals → GRID` with the GRID argument in slot 0, pure, and raises `ExecError` outside its domain.
+
+| op | signature · literal domain | semantics |
+|---|---|---|
+| `UPSCALE` | GRID × INTEGER{2..5} | every cell becomes a k×k block; computed factor must be ≥ 1; side > 30 raises |
+| `DOWNSCALE` | GRID × INTEGER{2..5} | each k×k block → its most frequent colour (tie → larger colour); k must divide H and W |
+| `DOWNSCALE_ANY` | GRID × INTEGER{2..5} | as DOWNSCALE over the non-zero colours only; an all-zero block → 0 |
+| `KRON_SELF` | GRID | self-Kronecker: each non-zero cell → a copy of the grid, each 0 → an empty block (sides ≤ 5) |
+| `UPSCALE_NC` | GRID | UPSCALE by the number of distinct non-zero colours (none raises) |
+| `PANEL_BOOL` | GRID × INTEGER{0..5} × COLOR{1..9} | split into panels (`grid_panels`), cell-wise rule over the panels' non-zero masks: 0 AND, 1 OR, 2 XOR (odd count), 3 NOR, 4 FIRST_ONLY, 5 LAST_ONLY; "on" cells get the colour, others 0 |
+| `PANEL_OVERLAY` | GRID × INTEGER{0..7} | stack the panels; each cell takes the non-zero colour of the highest-priority panel. Order `panel_priority(n, k)`: k < n = reading order rotated to start at k, n ≤ k < 2n = its reverse; k ≥ 2n raises |
+| `CONNECT_SAME` | GRID × COLOR{0..9} | fill the background between two equal-coloured cells on one row / column (only background between them) with the colour; 0 = the pair's own colour. All tests read the input grid |
+| `FILL_EMPTY_LINES` | GRID × COLOR{1..9} | rows / columns whose interior (grid minus its outer ring) is all 0 get their interior painted; sides < 3 unchanged |
+| `BBOX_FILL` | GRID × COLOR{1..9} | paint the 0-cells inside the bbox of every colour-agnostic 8-connected non-zero component |
+
+`grid_panels(g)`: separators are full rows and/or columns of one colour (non-zero colours first, then 0) that
+yield ≥ 2 non-empty equally shaped panels (reading order); otherwise left/right halves when W is even and
+W ≥ 2H − 1, else top/bottom halves when H is even; otherwise `ExecError`.
+
+Canonical rules (`canonicalize.py`, `_rule_extensions`): `UPSCALE/DOWNSCALE/DOWNSCALE_ANY(g, 1) → g`;
+`DOWNSCALE(_ANY)(UPSCALE(g, k), k) → g`; `UPSCALE(UPSCALE(g, a), b) → UPSCALE(g, a·b)` when a·b ∈ 2..5;
+`UPSCALE(g, COUNT_OBJECTS(SELECT_ALL(g))) → UPSCALE_NC(g)`; `FILL_EMPTY_LINES(FILL_EMPTY_LINES(g, c), d) →
+FILL_EMPTY_LINES(g, c)` for a literal c ≠ 0; the D4-equivariant ops (the four scalings, KRON_SELF, BBOX_FILL,
+FILL_EMPTY_LINES) with literal arguments move a D4 argument outside: `op(D(g), lits) → D(op(g, lits))`.
+CONNECT_SAME and the panel ops are not D4-equivariant and are left alone. `mutate(..., "swap_op")` moves an
+out-of-domain integer literal to the nearest allowed one (`REPEAT_X(g, 1) → UPSCALE(g, 2)`).
+
+Synthetic sampler: `program_sampler.PRIMITIVE_WEIGHTS` lists every extension (CONNECT_SAME, FILL_EMPTY_LINES,
+BBOX_FILL down-weighted to 0.15); `dataset.input_shape_hint(prog)` draws shaped inputs (`kron`, `blocks`,
+`blocks_any`, `panels`, `small`) for the ops random inputs almost never satisfy; each extension appears in
+≈ 4–6 % of the accepted synthetic tasks (test floor 2 %).
+
+**Package compatibility (binding):** the program-encoder vocabulary is rebuilt from `REGISTRY`, but
+`ProgramTokenizer.load` keeps a saved `vocab.json` order. A package exported before the extensions (76 ops = 72 +
+4 structural) loads strictly under the 86-op DSL: its embedding sizes are unchanged, extension ops encode to
+`<unk>`, programs containing them are still scored (finite), and the symbolic search still finds them
+(`tests/test_search.py::test_package_exported_before_the_extensions_loads_and_solves`).
+
+Related search-side additions (contracts in §6's files, listed here for completeness): `arcjepa/search/induce.py`
+(`induce_recolor(pairs, test_inputs, *, time_budget_s, deadline) -> Optional[RecolorRule]`, `induced_candidate`;
+a per-object property → colour/keep table, run by `solve_task` before the beam within ≤ 10 % of the budget,
+`SolveConfig.induce`, diagnostic program label `(INDUCE_RECOLOR <segmentation> <property>)`, not a DSL program)
+and the `ArgPool` relational fillers (`FILTER` sets vs. the largest/smallest object, NEAREST/FARTHEST, object
+colours and bboxes, AND-masks of INPUT with its D4 images; rich pools only).
+
+Tests pinning the extensions (hand-written expected outputs): `tests/test_dsl.py::test_extension_*` (every one of
+the ten ops, their `ExecError` domains, the canonical rules and the D4-equivariance they rely on),
+`tests/test_synthetic.py::test_make_task_builds_valid_tasks_for_every_spec_extension` /
+`test_generated_tasks_exercise_every_spec_extension`, `tests/test_model.py::test_tokenizer_vocab_includes_the_dsl_spec_extensions`,
+`tests/test_search.py::test_induce_recolor_*` (fires correctly on 6 val audit tasks from `tests/data/induce_tasks.json`,
+returns `None` on conflicting tables), `test_argpool_relational_fillers_values_and_beam_use` and
+`test_package_exported_before_the_extensions_loads_and_solves`. All fixture tasks are Val-150 ids (never Hard-180,
+never public eval).
+
 ## 2. Parser — `arcjepa/parser/` (agent A2)
 * `objects.py`: `@dataclass(frozen=True) class Object: cells: FrozenSet[Tuple[int,int]]; color_hist:
   Tuple[Tuple[int,int],...]; primary_color: int; bbox: Tuple[int,int,int,int]  # r0,c0,r1,c1 inclusive`;

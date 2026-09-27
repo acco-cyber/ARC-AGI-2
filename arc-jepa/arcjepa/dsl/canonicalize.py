@@ -13,6 +13,16 @@ Rewrites applied bottom-up to a fixpoint:
 * commutative / mirrored relations: ``TOUCHING`` and ``OVERLAPPING`` arguments sorted; ``RIGHT_OF(a,b) →
   LEFT_OF(b,a)``, ``BELOW → ABOVE``, ``CONTAINS → INSIDE``; ``SWAP_COLORS`` colours sorted;
 * conditionals: ``IF(True,a,b) → a``, ``IF(False,a,b) → b``, ``IF(c,a,a) → a``; ``COMPOSE`` bodies are inlined.
+* spec extensions (INTERFACES.md §1 "Spec extensions"): ``UPSCALE / DOWNSCALE / DOWNSCALE_ANY (g, 1) → g``;
+  ``DOWNSCALE(_ANY)(UPSCALE(g, k), k) → g``; ``UPSCALE(UPSCALE(g, a), b) → UPSCALE(g, a·b)`` when ``a·b`` is a
+  literal of the op; ``UPSCALE(g, COUNT_OBJECTS(SELECT_ALL(g))) → UPSCALE_NC(g)``;
+  ``FILL_EMPTY_LINES(FILL_EMPTY_LINES(g, c), d) → FILL_EMPTY_LINES(g, c)`` for a non-zero literal ``c`` (no empty
+  line survives the first pass); and the D4-equivariant extensions (the scalings, KRON_SELF, BBOX_FILL,
+  FILL_EMPTY_LINES) move a D4 argument outside, ``op(D(g), lits) → D(op(g, lits))``, so it can merge with other
+  D4 ops.  The move is made only when every other argument is a literal, so it never increases the depth.
+  CONNECT_SAME and the panel ops are not D4-equivariant (fill priority, panel order) and are left alone.
+
+No rule increases a program's depth.
 """
 from __future__ import annotations
 
@@ -156,8 +166,45 @@ def _rule_conditional(n: Node) -> Optional[Node]:
     return None
 
 
+#: Extensions whose GRID argument (slot 0) commutes with every D4 op: op(D(g), ...) == D(op(g, ...)).
+_D4_EQUIVARIANT = frozenset({"UPSCALE", "DOWNSCALE", "DOWNSCALE_ANY", "UPSCALE_NC", "KRON_SELF", "BBOX_FILL",
+                             "FILL_EMPTY_LINES"})
+_DOWNSCALES = frozenset({"DOWNSCALE", "DOWNSCALE_ANY"})
+
+
+def _is_int_lit(x: object) -> bool:
+    return isinstance(x, int) and not isinstance(x, bool)
+
+
+def _rule_extensions(n: Node) -> Optional[Node]:
+    op, a = n.op, n.args
+    prim = REGISTRY.get(op)
+    if prim is None or not prim.extension:
+        return None
+    inner = a[0] if a and isinstance(a[0], Node) else None
+    if op in ("UPSCALE", "DOWNSCALE", "DOWNSCALE_ANY") and _is_int_lit(a[1]) and a[1] == 1:
+        return a[0]  # type: ignore[return-value]
+    if inner is None:
+        return None
+    if op in _DOWNSCALES and inner.op == "UPSCALE" and inner.args[1] == a[1]:
+        return inner.args[0]  # type: ignore[return-value]  (equal k: a literal, or the same pure expression)
+    if op == "UPSCALE" and inner.op == "UPSCALE" and _is_int_lit(a[1]) and _is_int_lit(inner.args[1]):
+        k = a[1] * inner.args[1]  # type: ignore[operator]
+        if k in REGISTRY["UPSCALE"].literal_args.get(1, ()):
+            return Node("UPSCALE", (inner.args[0], k))
+    if (op == "UPSCALE" and isinstance(a[1], Node) and a[1].op == "COUNT_OBJECTS" and isinstance(a[1].args[0], Node)
+            and a[1].args[0].op == "SELECT_ALL" and a[1].args[0].args[0] == a[0]):
+        return Node("UPSCALE_NC", (a[0],))
+    if (op == "FILL_EMPTY_LINES" and inner.op == "FILL_EMPTY_LINES" and _is_int_lit(inner.args[1])
+            and inner.args[1] != 0):
+        return inner
+    if op in _D4_EQUIVARIANT and inner.op in GEOMETRIC_OPS and all(_is_lit(x) for x in a[1:]):
+        return Node(inner.op, (Node(op, (inner.args[0],) + a[1:]),))
+    return None
+
+
 _RULES: List[Callable[[Node], Optional[Node]]] = [_rule_alias, _rule_geometric, _rule_identity, _rule_idempotent,
-                                                 _rule_relations, _rule_conditional]
+                                                 _rule_relations, _rule_conditional, _rule_extensions]
 
 
 def _canon(node: Node, budget: List[int]) -> Node:

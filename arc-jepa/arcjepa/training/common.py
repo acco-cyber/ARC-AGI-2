@@ -160,8 +160,16 @@ def pick_device(pref: str = "auto", local_rank: int = 0) -> torch.device:
     return torch.device(f"cuda:{local_rank}")
 
 
-def init_distributed(device_pref: str = "auto") -> DistInfo:
+#: collective timeout of the torchrun process group. torch's NCCL default (10 min) is shorter than the main-rank-only
+#: phases (held-out retrieval eval, val loss) that the other ranks wait out in a barrier; a crashed rank is still
+#: detected at once by torchrun's agent (process exit), so the long timeout only bounds true hangs.
+DIST_TIMEOUT_MINUTES = 120.0
+
+
+def init_distributed(device_pref: str = "auto", timeout_minutes: float = DIST_TIMEOUT_MINUTES) -> DistInfo:
     """Initialise ``torch.distributed`` when launched by ``torchrun`` (WORLD_SIZE > 1), else a plain process."""
+    import datetime
+
     world = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
@@ -173,8 +181,9 @@ def init_distributed(device_pref: str = "auto") -> DistInfo:
     if device.type == "cuda":
         torch.cuda.set_device(device)
     if not tdist.is_initialized():
-        tdist.init_process_group(backend="nccl" if device.type == "cuda" else "gloo")
-    log.info("distributed: rank %d/%d on %s", rank, world, device)
+        tdist.init_process_group(backend="nccl" if device.type == "cuda" else "gloo",
+                                 timeout=datetime.timedelta(minutes=float(timeout_minutes)))
+    log.info("distributed: rank %d/%d on %s (collective timeout %.0f min)", rank, world, device, timeout_minutes)
     return DistInfo(rank, world, local_rank, device, True)
 
 
@@ -703,17 +712,43 @@ def _chunks(seq: Sequence[Any], size: int) -> Iterator[Sequence[Any]]:
         yield seq[s:s + size]
 
 
+class _InferenceEpisodes(Dataset):
+    """Episodes in the inference layout (no output objects), for parallel tensorisation in :func:`rule_latents`."""
+
+    def __init__(self, episodes: Sequence[Episode], parser: Any, max_ctx: int) -> None:
+        self.episodes = list(episodes)
+        self.parser = parser
+        self.max_ctx = int(max_ctx)
+
+    def __len__(self) -> int:
+        return len(self.episodes)
+
+    def __getitem__(self, i: int) -> Dict[str, Tensor]:
+        return encode_item(self.episodes[i], self.parser, self.max_ctx, out_objects=False)
+
+
 @torch.no_grad()
 def rule_latents(model: ARCJEPA, episodes: Sequence[Episode], parser: Any, device: torch.device, *,
-                 max_ctx: int = 10, batch_size: int = 16, precision: str = "fp32") -> Tensor:
-    """r_task Float[N, rule_dim] (fp32, CPU) for episodes; output grids carry no objects (inference layout)."""
+                 max_ctx: int = 10, batch_size: int = 16, precision: str = "fp32", num_workers: int = 0) -> Tensor:
+    """r_task Float[N, rule_dim] (fp32, CPU) for episodes; output grids carry no objects (inference layout).
+
+    ``num_workers`` > 0 tensorises (object parsing + relation features, the CPU-bound part) in DataLoader worker
+    processes, in order; the forward pass runs on ``device``.
+    """
     was = model.training
     model.eval()
     parser = resolve_parser(parser)
     outs: List[Tensor] = []
+    eps = list(episodes)
     try:
-        for chunk in _chunks(list(episodes), batch_size):
-            batch = collate_items([encode_item(ep, parser, max_ctx, out_objects=False) for ep in chunk])
+        if num_workers > 0 and len(eps) > batch_size:
+            batches: Any = DataLoader(_InferenceEpisodes(eps, parser, max_ctx), batch_size=batch_size, shuffle=False,
+                                      collate_fn=collate_items, num_workers=int(num_workers),
+                                      pin_memory=device.type == "cuda")
+        else:
+            batches = (collate_items([encode_item(ep, parser, max_ctx, out_objects=False) for ep in chunk])
+                       for chunk in _chunks(eps, batch_size))
+        for batch in batches:
             with autocast(device, precision):
                 r = model.rule_from_episode(to_device(batch, device))
             outs.append(r.float().cpu())
@@ -835,6 +870,20 @@ def _stage_steps(cfg: Mapping[str, Any], spec: StageSpec, sampler: EpochBatchSam
     return planned, int(round(warm_frac * planned))
 
 
+def shrink_schedule(step: int, total: int, warmup: int, warm_frac: float, sec_per_step: float,
+                    seconds_left: float) -> Tuple[int, int]:
+    """``(total, warmup)`` after re-estimating how many optimizer steps fit into ``seconds_left``.
+
+    The total only shrinks (never below ``step + 1``) so the cosine ends inside the time budget, and the warmup
+    keeps ``warm_frac`` of the shrunk total (it never grows back).
+    """
+    allowed = step + int(max(0.0, seconds_left) / max(sec_per_step, 1e-6))
+    if allowed < total:
+        total = max(step + 1, allowed)
+        warmup = min(warmup, int(round(warm_frac * total)))
+    return total, warmup
+
+
 def evaluate_retrieval(ctx: TrainContext, stage: str) -> Dict[str, float]:
     """Retrieval@k on the held-out synthetic set (main rank computes; other ranks wait)."""
     res: Dict[str, float] = {}
@@ -848,14 +897,52 @@ def evaluate_retrieval(ctx: TrainContext, stage: str) -> Dict[str, float]:
     return res
 
 
+LOSS_KEYS: Tuple[str, ...] = ("total", "L_g", "L_o", "L_r", "L_prog", "L_rank", "L_var", "collapse_std")
+
+
+def split_bounds(n: int, parts: int) -> List[Tuple[int, int]]:
+    """``parts`` contiguous near-equal ``[a, b)`` ranges covering ``range(n)`` (fewer when ``n < parts``)."""
+    parts = max(1, min(int(parts), int(n)))
+    cuts = [round(i * n / parts) for i in range(parts + 1)]
+    return [(a, b) for a, b in zip(cuts[:-1], cuts[1:]) if b > a]
+
+
+def forward_backward(model: ARCJEPA, target: EMATargetEncoder, batch: Mapping[str, Any], pos: Optional[Sequence[Any]],
+                     neg: Optional[Sequence[Any]], weights: LossWeights, device: torch.device, precision: str,
+                     accum: int, parts: int = 1) -> Optional[Dict[str, float]]:
+    """One micro-batch: loss forward + backward (scaled by ``1 / accum``), processed as ``parts`` chunks along
+    the batch axis (gradient accumulation inside the micro-batch; ``parts > 1`` after a CUDA OOM). Returns the
+    batch-weighted loss terms, or ``None`` when a loss is non-finite (the caller discards the gradients)."""
+    n = int(batch["ctx_in"].shape[0])
+    vals: Dict[str, float] = {}
+    for a, b in split_bounds(n, parts):
+        frac = (b - a) / float(n)
+        chunk = {k: (v[a:b] if torch.is_tensor(v) and v.dim() > 0 and v.shape[0] == n else v) for k, v in batch.items()}
+        with autocast(device, precision):
+            out = jepa_losses(model, target, to_device(chunk, device),
+                              programs_pos=None if pos is None else list(pos[a:b]),
+                              programs_neg=None if neg is None else list(neg[a:b]), weights=weights)
+        loss = out["total"].float()
+        if not torch.isfinite(loss):
+            return None
+        (loss * (frac / accum)).backward()
+        for k in LOSS_KEYS:
+            vals[k] = vals.get(k, 0.0) + frac * float(out[k].detach().float().item())
+        del out, loss
+    return vals
+
+
 def run_stage(ctx: TrainContext, spec: StageSpec, budget_s: float) -> Dict[str, Any]:
     """Optimise one stage for at most ``budget_s`` seconds (or its planned steps), resumably.
 
     Per optimizer step: autocast forward of :func:`jepa_losses`, backward (``accum_steps`` micro-batches),
     cross-rank gradient averaging, clipping, AdamW, EMA target update (when the encoder is trainable), JSONL
     logging every ``log_every`` steps, retrieval eval every ``eval.every_steps`` in program stages, and a
-    checkpoint every ``checkpoint_minutes``. The stage is recorded as completed at the end (also when it stops
-    on its time budget). Returns a summary dict.
+    checkpoint every ``checkpoint_minutes``. The planned step count shrinks to what the time budget allows
+    (measured after 4 steps) and the warmup keeps its planned fraction of that shrunk schedule. The stage is
+    recorded as completed at the end (also when it stops on its time budget). A CUDA out-of-memory error halves
+    the micro-batch (the batch is processed in two accumulated chunks from then on, same global batch) up to
+    ``training.oom_max_split`` (default 2 = once) instead of crashing. Returns a summary dict.
     """
     cfg, model, dev, dist = ctx.cfg, ctx.model, ctx.device, ctx.dist
     tr = cfg.get("training") or {}
@@ -868,6 +955,10 @@ def run_stage(ctx: TrainContext, spec: StageSpec, budget_s: float) -> Dict[str, 
                                 world_size=dist.world_size, weights=spec.weights,
                                 epoch_size=spec.cfg.get("epoch_size"))
     planned, warmup = _stage_steps(cfg, spec, sampler, accum)
+    # warmup is a FRACTION of the schedule: when the time budget shrinks `total` below the epoch plan, the warmup
+    # shrinks with it (otherwise e.g. stage A's 5-of-50-epoch warmup = ~1.9k steps would fill most of a ~3k-step
+    # time-boxed stage)
+    warm_frac = warmup / float(max(1, planned))
     opt, trainable = build_optimizer(model, cfg, spec.cfg)
     weights = loss_weights(cfg, spec.cfg)
     ema_on = any(p.requires_grad for p in model.encoder.parameters())
@@ -879,6 +970,8 @@ def run_stage(ctx: TrainContext, spec: StageSpec, budget_s: float) -> Dict[str, 
     out_obj_drop = float(cfg_get(cfg, "data.out_objects_drop", 0.0))
     num_workers = int(tr.get("num_workers", 0))
     drop_rng = random.Random(seed_for(cfg.get("seed", 0), name, "drop", dist.rank))
+    split = 1  # micro-batch chunks; doubled (up to training.oom_max_split) when CUDA runs out of memory
+    max_split = max(1, int(tr.get("oom_max_split", 2)))
 
     step, epoch, offset, total = 0, 0, 0, planned
     rs = ctx.resume
@@ -892,6 +985,7 @@ def run_stage(ctx: TrainContext, spec: StageSpec, budget_s: float) -> Dict[str, 
             log.warning("stage %s: optimizer state not restored (%s)", name, exc)
         log.info("stage %s: resuming at step %d/%d (epoch %d, batch %d)", name, step, total, epoch, offset)
     ctx.resume = None
+    warmup = min(warmup, int(round(warm_frac * total)))
 
     def stage_state() -> Dict[str, Any]:
         return {"step": step, "epoch": epoch, "offset": offset, "total": total, "planned": planned}
@@ -909,8 +1003,9 @@ def run_stage(ctx: TrainContext, spec: StageSpec, budget_s: float) -> Dict[str, 
         return time.time() >= deadline and step >= min_steps
 
     stop = step >= total or out_of_time()
-    log.info("stage %s (%s): %d items, batch %d x accum %d x world %d, planned %d steps, budget %.0fs",
-             name, STAGE_NAMES.get(name, name), len(spec.dataset), bs, accum, dist.world_size, total, budget_s)
+    log.info("stage %s (%s): %d items, batch %d x accum %d x world %d, planned %d steps (warmup %d), budget %.0fs",
+             name, STAGE_NAMES.get(name, name), len(spec.dataset), bs, accum, dist.world_size, total, warmup,
+             budget_s)
     while not stop:
         if hasattr(spec.dataset, "set_epoch"):
             spec.dataset.set_epoch(epoch)
@@ -930,20 +1025,39 @@ def run_stage(ctx: TrainContext, spec: StageSpec, budget_s: float) -> Dict[str, 
             neg = batch.pop("programs_neg", None) if spec.use_negatives else None
             batch.pop("programs_pos", None)
             batch.pop("programs_neg", None)
-            batch = to_device(batch, dev)
-            with autocast(dev, ctx.precision):
-                out = jepa_losses(model, ctx.target, batch, programs_pos=pos, programs_neg=neg, weights=weights)
-            loss = out["total"].float()
-            if not torch.isfinite(loss):
+            while True:
+                oom_msg = None
+                try:
+                    vals = forward_backward(model, ctx.target, batch, pos, neg, weights, dev, ctx.precision,
+                                            accum, split)
+                except torch.cuda.OutOfMemoryError as exc:  # CUDA only: a CPU OOM is not recoverable here
+                    oom_msg = str(exc).splitlines()[0][:300] if str(exc) else "CUDA out of memory"
+                if oom_msg is None:
+                    break
+                # CUDA OOM: drop this accumulation window's partial gradients, halve the micro-batch (the same
+                # batch is then processed as `split` chunks with gradient accumulation) and retry it once.
+                opt.zero_grad(set_to_none=True)
+                micro = 0
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                if split * 2 > max_split or split * 2 > len(batch["ctx_in"]):
+                    raise torch.cuda.OutOfMemoryError(
+                        f"stage {name}: CUDA OOM at micro-batch {bs}/{split} (limit training.oom_max_split="
+                        f"{max_split}): {oom_msg}")
+                split *= 2
+                log.warning("stage %s step %d: CUDA OOM (%s); micro-batch %d -> %d x %d", name, step, oom_msg,
+                            bs, split, int(math.ceil(bs / split)))
+                ctx.metrics.log({"kind": "oom", "stage": name, "step": step, "split": split, "rank": dist.rank,
+                                 "batch_size": bs})
+            if vals is None:
                 skipped += 1
                 opt.zero_grad(set_to_none=True)
                 micro = 0
                 log.warning("stage %s step %d: non-finite loss skipped", name, step)
                 continue
-            (loss / accum).backward()
             micro += 1
-            for k in ("total", "L_g", "L_o", "L_r", "L_prog", "L_rank", "L_var", "collapse_std"):
-                agg[k] = agg.get(k, 0.0) + float(out[k].detach().float().item())
+            for k, v in vals.items():
+                agg[k] = agg.get(k, 0.0) + v
             n_agg += 1
             if micro < accum:
                 continue
@@ -966,9 +1080,7 @@ def run_stage(ctx: TrainContext, spec: StageSpec, budget_s: float) -> Dict[str, 
             elif steps_this_run >= 4:
                 # shrink the schedule so the cosine reaches its end inside the time budget
                 per = (now - t_first) / max(1, steps_this_run - 1)
-                allowed = step + int(max(0.0, deadline - now) / max(per, 1e-6))
-                if allowed < total:
-                    total = max(step + 1, allowed)
+                total, warmup = shrink_schedule(step, total, warmup, warm_frac, per, deadline - now)
             if step % log_every == 0 or step >= total:
                 rec = {"kind": "train", "stage": name, "step": step, "total": total, "epoch": epoch,
                        "global_step": ctx.global_step, "lr": max(g["lr"] for g in opt.param_groups),
@@ -991,9 +1103,9 @@ def run_stage(ctx: TrainContext, spec: StageSpec, budget_s: float) -> Dict[str, 
         if not stop and offset >= len(batches):
             epoch, offset = epoch + 1, 0
     summary: Dict[str, Any] = {"stage": name, "steps": step, "steps_this_run": steps_this_run,
-                               "total": total, "planned": planned,
+                               "total": total, "planned": planned, "warmup": warmup,
                                "epochs_done": epoch, "seconds": round(time.time() - t_start, 2),
-                               "skipped": skipped, "stopped_on_time": step < total}
+                               "skipped": skipped, "stopped_on_time": step < total, "oom_split": split}
     if spec.val_fn is not None:
         summary.update(spec.val_fn(ctx))
     summary.update(evaluate_retrieval(ctx, name))

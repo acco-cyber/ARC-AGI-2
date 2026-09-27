@@ -50,7 +50,10 @@ training:
 
 data:
   root: null                 # null -> $ARCJEPA_DATA, local mirror, Kaggle mount (arcjepa.data.resolve_root)
-  out_objects: true          # parse output grids too (object targets for L_o)
+  # v2 frozen split (arcjepa.data.splits, sha256-pinned): Train-670 trains; Val-150 and Hard-180 are blocked.
+  # Relative paths resolve against the working directory, then the package root. Must exist (no silent fallback).
+  split_file: data/splits_670_150_180.json
+  out_objects: true         # parse output grids too (object targets for L_o)
   out_objects_drop: 0.5      # per-batch probability of training without output objects (inference layout)
 
 synthetic:
@@ -74,7 +77,7 @@ stages:
     accum_steps: 1
     max_steps: null
     epoch_size: null
-  B:                         # real ARC adaptation on the 700 re-split train tasks
+  B:                         # real ARC adaptation on the train ids of data.split_file (Train-670)
     enabled: true
     min_steps: 1             # optimizer steps taken even when the time budget is already spent
     lr: 3.0e-5
@@ -83,7 +86,11 @@ stages:
     batch_size: 32           # tasks per GPU
     epoch_size: 700
     max_ctx: 10
-    configs: [episodes, episodes_aug, arcgen_fresh, sdg_hard]
+    # sdg_hard is NOT used: 143/228 of its puzzles derive from public-eval parents (REVIEW_2026-09-26); train_real
+    # refuses it unless allow_sdg_hard is true, and then keeps only ids listed in sdg_allowlist.
+    configs: [episodes, episodes_aug, arcgen_fresh]
+    allow_sdg_hard: false
+    sdg_allowlist: []
     hf_splits: [train, val, test]   # files of the HF mirror; eval_public is never read
     max_per_config: null
     family_alpha: 0.5        # sampling weight = family_count^-alpha, without replacement per epoch
@@ -120,9 +127,13 @@ eval:
 memory:
   top_k: 16
   max_synthetic: 20000       # synthetic train programs in the exported memory
-  include_real: true         # 700 re-split training tasks (never val / holdout / eval)
+  include_real: true         # train ids of load_resplit() = Train-670 (never val / Hard-180 / eval)
   max_real: null
-  pseudo_label_seconds: 0.5  # beam budget per real task; a label is kept only if it fits ALL train pairs
+  # beam budget per real task; a label is kept only if it fits ALL train pairs. Measured 09-26: 0.25 s and 0.5 s
+  # both label 2/40 train tasks; the total cap bounds the rank-0 export (700 x 0.25 s would be 175 s).
+  pseudo_label_seconds: 0.25
+  pseudo_label_total_seconds: 180
+  num_workers: null          # memory tensorisation workers (null = min(8, cpus - 1) on CUDA, 0 on CPU)
 
 export:
   dir: package

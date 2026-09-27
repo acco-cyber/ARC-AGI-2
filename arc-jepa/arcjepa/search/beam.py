@@ -45,7 +45,7 @@ from arcjepa.dsl.types import LITERAL_TYPES, POSITION_ANCHORS, UNIT_DIRECTIONS, 
 
 from .candidate import (ALPHA, BETA, GAMMA, Candidate, Prior, apply_prior, candidate_from_outputs, canonical_key,
                         complexity, make_candidate, sort_candidates)
-from .verifier import TargetInfo, demo_outputs, outputs_key, total_cells
+from .verifier import TargetInfo, clipped_timeout, demo_outputs, outputs_key, total_cells
 
 __all__ = ["beam_search", "ArgPool", "PoolItem", "Template", "TEMPLATES", "SearchContext", "SearchTimeout",
            "task_palette", "grid_ok"]
@@ -197,7 +197,7 @@ class ArgPool:
         vals: List[Any] = []
         for g in self.grids:
             try:
-                vals.append(evaluate(expr, g, timeout_s=0.05))
+                vals.append(evaluate(expr, g, timeout_s=clipped_timeout(0.05)))
             except ExecError:
                 return None
             except Exception:  # pragma: no cover - defensive
@@ -250,6 +250,37 @@ class ArgPool:
         for b in (cc4, cc8):
             for body in bodies:
                 self.add(T.OBJECT_SET, _n("APPLY_TO_EACH", b, body))
+        self._build_relational()
+
+    #: FILTER relations used for the relational object sets of :meth:`_build_relational`.
+    FILTER_RELATIONS: Tuple[str, ...] = ("LARGER", "SMALLER", "INSIDE", "CONTAINS", "TOUCHING", "SAME_COLOR",
+                                         "SAME_SHAPE")
+
+    def _build_relational(self) -> None:
+        """Relational fillers (docs/SOLVE_RATE_AUDIT.md addition 6): for the largest / smallest cc4 / cc8 object
+        ``a``, the sets ``FILTER(objects, rel, a)`` with their largest / smallest member and recoloured copies, the
+        NEAREST / FARTHEST object to ``a``; then the colour and bbox of every object filler; and the AND-masks of
+        INPUT with each of its D4 images (``SELECT_NONZERO (PATTERN_FILL INPUT (SELECT_NONZERO INPUT) (D INPUT))``).
+        """
+        cc4, cc8, _ = self.OS_BASE
+        cols = [c for c in self.out_palette if c]
+        for b in (cc4, cc8):
+            for a in (_n("SELECT_LARGEST", b), _n("SELECT_SMALLEST", b)):
+                for rel in self.FILTER_RELATIONS:
+                    s = _n("FILTER", b, rel, a)
+                    if self.add(T.OBJECT_SET, s) is not None:
+                        self.add(T.OBJECT, _n("SELECT_LARGEST", s))
+                        self.add(T.OBJECT, _n("SELECT_SMALLEST", s))
+                        for c in cols:
+                            self.add(T.OBJECT_SET, _n("APPLY_TO_EACH", s, _n("RECOLOR", OBJ, c)))
+                for op in ("NEAREST", "FARTHEST"):
+                    self.add(T.OBJECT, _n(op, b, a))
+        for it in list(self.items[T.OBJECT]):
+            self.add(T.COLOR, _n("ARGMAX_SIZE", _n("DUPLICATE", it.expr, (0, 0))))  # the object's colour
+            self.add(T.MASK, _n("GET_BBOX", it.expr))
+        nz = _n("SELECT_NONZERO", INPUT)
+        for op in ("ROTATE90", "ROTATE180", "ROTATE270", "REFLECT_H", "REFLECT_V", "REFLECT_D1", "REFLECT_D2"):
+            self.add(T.MASK, _n("SELECT_NONZERO", _n("PATTERN_FILL", INPUT, nz, _n(op, INPUT))))
 
     # ------------------------------------------------------------------ fillers
     def literal_items(self, prim: Primitive, i: int) -> List[PoolItem]:
@@ -583,13 +614,28 @@ def beam_search(task_pairs: Sequence[Pair], *, prior: Optional[Prior] = None, wi
 
 def _expansion_variants(ctx: SearchContext, s: _State, prior: Optional[Prior],
                         top_primitives: int) -> List[Tuple[Template, Tuple[bool, ...]]]:
-    """(template, grid-slot flags) pairs to expand for state ``s`` (top primitives by the prior if given)."""
+    """(template, grid-slot flags) pairs to expand for state ``s`` (top primitives by the prior if given).
+
+    Primitives are ranked by the prior's best score over their representatives (each hole takes its first filler).
+    Primitives tied at the cut are ordered by their best representative's demo loss (then registry order), not by
+    registry order alone: when the spine dominates the prior's view (every representative scores the same), the
+    first registered primitives would otherwise always win the remaining slots.  The loss is computed only for
+    that tied group, so a prior without ties costs no extra evaluation.
+
+    Primitives in ``prior.unseen_ops`` (ops the model's vocabulary lacks, e.g. the DSL spec extensions under a
+    package exported before them) are always expanded and never take one of the ``top_primitives`` slots: their
+    ``<unk>`` score says nothing about them.
+    """
     variants = [(tpl, flags) for tpl in TEMPLATES for flags in tpl.grid_variants()]
     if prior is None or top_primitives <= 0:
         return variants
+    always = frozenset(getattr(prior, "unseen_ops", None) or ())
     reps: List[Node] = []
     idx: List[int] = []
+    combos: List[Tuple[PoolItem, ...]] = []
     for i, (tpl, flags) in enumerate(variants):
+        if tpl.name in always:
+            continue
         combo = []
         ok = True
         for slot in tpl.holes(flags):
@@ -601,6 +647,7 @@ def _expansion_variants(ctx: SearchContext, s: _State, prior: Optional[Prior],
         if ok:
             reps.append(ctx.build(tpl, flags, s.program, combo))
             idx.append(i)
+            combos.append(tuple(combo))
     if not reps:
         return variants
     scores = prior(reps)
@@ -608,7 +655,24 @@ def _expansion_variants(ctx: SearchContext, s: _State, prior: Optional[Prior],
     for i, sc in zip(idx, scores):
         name = variants[i][0].name
         best[name] = max(best.get(name, float("-inf")), float(sc))
-    keep = set(sorted(best, key=lambda n: -best[n])[:top_primitives])
+    ranked = sorted(best, key=lambda n: -best[n])
+    if len(ranked) > top_primitives:
+        cut = best[ranked[top_primitives - 1]]
+        above = [n for n in ranked if best[n] > cut]
+        tied = [n for n in ranked if best[n] == cut]
+        if len(above) + len(tied) > top_primitives:
+            loss: Dict[str, float] = {}
+            tied_set = set(tied)
+            for i, sc, combo in zip(idx, scores, combos):
+                tpl, flags = variants[i]
+                if tpl.name not in tied_set or float(sc) != cut:
+                    continue
+                outs = ctx.apply(tpl, flags, s.values, combo)
+                if outs is not None:
+                    loss[tpl.name] = min(loss.get(tpl.name, float("inf")), ctx.rank_loss(outs))
+            tied.sort(key=lambda n: loss.get(n, float("inf")))  # stable: registry order breaks remaining ties
+            ranked = above + tied
+    keep = set(ranked[:top_primitives]) | always
     return [(tpl, flags) for tpl, flags in variants if tpl.name in keep]
 
 

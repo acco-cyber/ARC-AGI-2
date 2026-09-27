@@ -56,33 +56,41 @@ def stage_budget(stage: str, remaining_stages: Sequence[str], seconds_left: floa
 
 def memory_sources(cfg: Mapping[str, Any], store: Optional[SynthStore], train_idx: Sequence[int]
                    ) -> Tuple[List[Any], Dict[str, Task], Dict[str, str], List[str]]:
-    """``(synthetic tasks, real training tasks, their families, eval_public ids)`` for the exported memory.
+    """``(synthetic tasks, real training tasks, their families, blocked ids)`` for the exported memory.
 
-    Synthetic: the first ``memory.max_synthetic`` synthetic *train*-split tasks. Real: the 700 re-split train
-    tasks (capped at ``memory.max_real``) when ``memory.include_real``; never val / holdout / eval_public.
+    Synthetic: the first ``memory.max_synthetic`` synthetic *train*-split tasks (generated in-session; never
+    sdg_hard). Real: the 700 re-split train tasks (capped at ``memory.max_real``) when ``memory.include_real``.
+    ``blocked ids`` = eval_public + the 150 val + the 150 holdout ids; the export refuses any of them, and the
+    real tasks are checked here to be a subset of the 700 train ids (so no sdg / non-ARC id can enter).
     """
     mcfg = cfg.get("memory") or {}
     n_syn = int(mcfg.get("max_synthetic", 1000))
     synth = [store.task(i) for i in list(train_idx)[:n_syn]] if store is not None else []
     real: Dict[str, Task] = {}
     fams: Dict[str, str] = {}
-    eval_ids: List[str] = []
+    blocked: List[str] = []
     if mcfg.get("include_real", True):
         try:
             from arcjepa.data.hf_loader import EVAL_PUBLIC, load_resplit, load_training_tasks, resolve_root
-            from arcjepa.training.train_real import load_split_families, official_task_splits
+            from arcjepa.training.train_real import EvalLeakError, load_split_families, official_task_splits
 
             root = resolve_root(cfg_get(cfg, "data.root"))
-            ids = sorted(load_resplit(root)["train"])
+            splits = load_resplit(root)
+            train_ids = set(splits["train"])
+            ids = sorted(train_ids)
             cap = mcfg.get("max_real")
             ids = ids[: int(cap)] if cap is not None else ids
             tasks = load_training_tasks(root)
             real = {t: tasks[t] for t in ids if t in tasks}
             fams = load_split_families(root, ids)
-            eval_ids = sorted(t for t, s in official_task_splits(root).items() if s == EVAL_PUBLIC)
+            blocked = sorted({t for t, s in official_task_splits(root).items() if s == EVAL_PUBLIC}
+                             | set(splits["val"]) | set(splits["holdout"]))
+            outside = sorted(set(real) - train_ids)
+            if outside or set(real) & set(blocked):
+                raise EvalLeakError(f"memory real tasks outside the 700 train split: {outside[:5]}")
         except (FileNotFoundError, OSError) as exc:
             log.warning("memory: real training tasks unavailable (%s)", exc)
-    return synth, real, fams, eval_ids
+    return synth, real, fams, blocked
 
 
 def train(cfg: Dict[str, Any], *, hours: float, out_dir: str, stages: str = "ABCD", resume: bool = True,
@@ -147,6 +155,11 @@ def train(cfg: Dict[str, Any], *, hours: float, out_dir: str, stages: str = "ABC
                                    "global_step": ctx.global_step, "n_params": n_params}
         if export:
             pkg_dir = Path(export_dir) if export_dir else out / str(cfg_get(cfg, "export.dir", "package"))
+            # Under torchrun the export (tens of thousands of rule latents + pseudo-label searches) runs on rank 0
+            # only. Every rank meets once more, then ALL ranks destroy the process group: ranks 1..N-1 return and
+            # exit cleanly and rank 0 exports with no collective pending, so no NCCL timeout can abort it.
+            barrier(dist)
+            cleanup_distributed(dist)
             if dist.is_main:
                 from arcjepa.training.export import export_package
 
@@ -158,7 +171,6 @@ def train(cfg: Dict[str, Any], *, hours: float, out_dir: str, stages: str = "ABC
                 metrics.log({"kind": "export", "dir": res["dir"], "memory_size": res["memory_size"],
                              "seconds": res["seconds"]})
                 summary["package"] = res
-            barrier(dist)
         summary["seconds"] = round(time.time() - t_start, 2)
         if dist.is_main:
             (out / "train_summary.json").write_text(json.dumps(summary, indent=1, default=str), encoding="utf-8")

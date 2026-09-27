@@ -24,6 +24,11 @@ every training loader is restricted to.
 The deterministic family-balanced 700 / 150 / 150 re-split of the 1,000 training tasks (seed 20260926) is
 computed by :func:`resplit_700_150_150` and persisted by :func:`ensure_resplit` to
 ``<root>/splits_700_150_150.json`` and ``<package root>/data/splits_700_150_150.json``.
+
+ARC-JEPA v2 trains on the frozen **Train-670 / Val-150 / Hard-180** split ``data/splits_670_150_180.json``
+(:mod:`arcjepa.data.splits`, sha256-pinned). :func:`load_resplit` reads it by default (``split_file`` / the
+config key ``data.split_file`` select another document); its ``holdout`` entry is the Hard-180 list, so every
+caller that blocks ``val`` + ``holdout`` keeps Hard-180 out of training.
 """
 from __future__ import annotations
 
@@ -64,6 +69,9 @@ RESPLIT_NAMES: Tuple[str, ...] = ("train", "val", "holdout")
 SPLITS_FILENAME = "splits_700_150_150.json"
 PACKAGE_ROOT = Path(__file__).resolve().parents[2]
 PACKAGE_DATA_DIR = PACKAGE_ROOT / "data"
+#: the frozen v2 split (Train-670 / Val-150 / Hard-180); the default of :func:`load_resplit`
+V2_SPLITS_FILENAME = "splits_670_150_180.json"
+DEFAULT_SPLIT_FILE = f"data/{V2_SPLITS_FILENAME}"
 
 # Card counts (docs README / stats.json of the mirror) used by the tests.
 CARD_COUNTS: Dict[str, int] = {
@@ -83,6 +91,13 @@ class EvalPublicGuardError(AssertionError):
 
 class DataRootNotFound(FileNotFoundError):
     """Raised when no local mirror of the dataset can be located."""
+
+
+class SplitFileMissing(RuntimeError):
+    """Raised when an explicitly requested split document does not exist.
+
+    Deliberately not a ``FileNotFoundError``: training code treats those as "real data unavailable" and skips a
+    stage, whereas a missing split file must stop the run (falling back to another split could leak Hard-180)."""
 
 
 # --------------------------------------------------------------------------------------------------------------
@@ -441,13 +456,35 @@ def write_splits(payload: Mapping[str, Any], path: str) -> str:
 
 
 def read_splits(path: str) -> Dict[str, List[str]]:
-    """Read a split document and return only the id lists ``{"train", "val", "holdout"}``."""
+    """Read a split document and return only the id lists ``{"train", "val", "holdout"}``.
+
+    For the v2 document (``splits_670_150_180.json``, keys ``train``/``val``/``hard180``) the result is
+    ``{"train": Train-670, "val": Val-150, "holdout": Hard-180, "hard180": Hard-180}``, so callers that block
+    ``val`` + ``holdout`` block Hard-180; the pinned sha256 of Hard-180 is verified on read.
+    """
     with open(path, "r", encoding="utf-8") as fh:
         doc = json.load(fh)
-    out = {name: list(doc[name]) for name in RESPLIT_NAMES}
     if EVAL_PUBLIC in doc:
         raise EvalPublicGuardError("a training split file must not carry eval_public ids")
-    return out
+    if "hard180" in doc and "holdout" not in doc:
+        from arcjepa.data.splits import verify_split
+
+        verify_split(doc)
+        return {"train": list(doc["train"]), "val": list(doc["val"]), "holdout": list(doc["hard180"]),
+                "hard180": list(doc["hard180"])}
+    return {name: list(doc[name]) for name in RESPLIT_NAMES}
+
+
+def resolve_split_file(split_file: Optional[str]) -> str:
+    """Absolute path of a split document: absolute paths as given; relative ones against the working directory,
+    then the package root (so ``data/splits_670_150_180.json`` works from anywhere, including Kaggle)."""
+    p = Path(str(split_file))
+    if p.is_absolute():
+        return str(p)
+    for base in (Path.cwd(), PACKAGE_ROOT):
+        if (base / p).is_file():
+            return str(base / p)
+    return str(PACKAGE_ROOT / p)
 
 
 def ensure_resplit(
@@ -497,8 +534,23 @@ def ensure_resplit(
     return splits
 
 
-def load_resplit(root: Optional[str] = None) -> Dict[str, List[str]]:
-    """Read ``splits_700_150_150.json`` from the package ``data/`` dir, else the data root, else compute it."""
+def load_resplit(root: Optional[str] = None, split_file: Optional[str] = None) -> Dict[str, List[str]]:
+    """The training split ``{"train", "val", "holdout"[, "hard180"]}``.
+
+    ``split_file`` (e.g. the config key ``data.split_file``) names the document explicitly; it must exist
+    (:class:`SplitFileMissing` otherwise). Without it the frozen v2 split ``data/splits_670_150_180.json`` is used
+    (Train-670 / Val-150 / Hard-180 as ``holdout``); only when that file is absent does the loader fall back to
+    ``splits_700_150_150.json`` from the package ``data/`` dir, else the data root, else compute it.
+    """
+    if split_file:
+        path = resolve_split_file(split_file)
+        if not os.path.isfile(path):
+            raise SplitFileMissing(f"split file {split_file!r} not found (resolved to {path})")
+        return read_splits(path)
+    v2 = PACKAGE_DATA_DIR / V2_SPLITS_FILENAME
+    if v2.is_file():
+        return read_splits(str(v2))
+    logger.warning("%s not found; falling back to the v1 700/150/150 split", v2)
     for path in (str(PACKAGE_DATA_DIR / SPLITS_FILENAME),):
         if os.path.isfile(path):
             return read_splits(path)
